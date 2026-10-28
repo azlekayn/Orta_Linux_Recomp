@@ -17,7 +17,6 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <urlmon.h>
-#include "unzip.h"
 
 #define PY_VER   L"3.13.2"
 #define PY_URL   L"https://www.python.org/ftp/python/" PY_VER L"/python-" PY_VER L"-embed-amd64.zip"
@@ -350,89 +349,9 @@ static BOOL fix_pth(const WCHAR *pydir)
     return TRUE;
 }
 
-/* ── unzipping (in-process: Wine/Proton on the Steam Deck has no tar.exe) ── */
-typedef struct { const WCHAR *dest; int files; DWORD err; } UnzCtx;
-
-static void *unz_alloc(unsigned long n) { return alloc(n); }
-static void unz_release(void *p) { release(p); }
-
-static int unz_put(void *vctx, const char *name, int is_dir, const unsigned char *data, unsigned long size)
-{
-    UnzCtx *c = vctx;
-    WCHAR rel[MAX_PATH], path[MAX_PATH * 2], dir[MAX_PATH * 2];
-    HANDLE h; DWORD w = 0; int i;
-    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, rel, MAX_PATH)) return 0;
-    for (i = 0; rel[i]; i++) if (rel[i] == L'/') rel[i] = L'\\';
-    if (i && rel[i - 1] == L'\\') rel[i - 1] = 0;
-    wsprintfW(path, L"%s\\%s", c->dest, rel);
-    if (is_dir) {
-        SHCreateDirectoryExW(NULL, path, NULL);
-        return 1;
-    }
-    lstrcpyW(dir, path);
-    for (i = lstrlenW(dir); i > 0 && dir[i] != L'\\'; i--) ;
-    dir[i] = 0;
-    SHCreateDirectoryExW(NULL, dir, NULL);
-    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) { c->err = GetLastError(); return 0; }
-    if (size && (!WriteFile(h, data, size, &w, NULL) || w != size)) {
-        c->err = GetLastError();
-        CloseHandle(h);
-        return 0;
-    }
-    CloseHandle(h);
-    c->files++;
-    return 1;
-}
-
-/* Unpacks `size` bytes of `path` starting at `offset` (a zip) into dest. */
-static BOOL unzip_file(const WCHAR *path, ULONGLONG offset, ULONGLONG size, const WCHAR *dest)
-{
-    HANDLE h = INVALID_HANDLE_VALUE;
-    unsigned char *buf = NULL;
-    UnzCtx c;
-    int rc = -1, tries;
-    LARGE_INTEGER sz;
-    WCHAR msg[MAX_PATH + 128];
-    /* A file just downloaded is often still open in the virus scanner for a
-     * moment: share everything, and try for a few seconds. */
-    for (tries = 0; tries < 20; tries++) {
-        h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        NULL, OPEN_EXISTING, 0, NULL);
-        if (h != INVALID_HANDLE_VALUE) break;
-        Sleep(500);
-    }
-    if (h == INVALID_HANDLE_VALUE) {
-        wsprintfW(msg, L"Could not open %s (Windows error %lu).", path, GetLastError());
-        log_line(msg);
-        return FALSE;
-    }
-    if (!size && GetFileSizeEx(h, &sz)) size = (ULONGLONG)sz.QuadPart - offset;
-    if (size && size < 0x7FFFFFFF) buf = alloc((SIZE_T)size);
-    if (!buf) {
-        wsprintfW(msg, L"Could not read %s: size %lu bytes.", path, (DWORD)size);
-        log_line(msg);
-    } else if (!read_at(h, offset, buf, (DWORD)size)) {
-        wsprintfW(msg, L"Could not read %s (Windows error %lu).", path, GetLastError());
-        log_line(msg);
-    } else {
-        c.dest = dest; c.files = 0; c.err = 0;
-        SHCreateDirectoryExW(NULL, dest, NULL);
-        rc = unz_extract(buf, (unsigned long)size, unz_put, &c, unz_alloc, unz_release);
-        if (rc) {
-            WCHAR msg[160];
-            wsprintfW(msg, L"Unzip error %d after %d files (Windows error %lu).", rc, c.files, c.err);
-            log_line(msg);
-        }
-    }
-    release(buf);
-    CloseHandle(h);
-    return rc == 0;
-}
-
 /* Single-file Setup.exe: the release zip is appended to the exe, followed by
  * its size (8 bytes) and "ORTAPAK1". It is unpacked into a work folder under
- * %LOCALAPPDATA%. */
+ * %LOCALAPPDATA% with Windows' own tar.exe. */
 static ULONGLONG payload_size(void)
 {
     HANDLE h = CreateFileW(g_self, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -450,32 +369,40 @@ static ULONGLONG payload_size(void)
 
 static BOOL unpack_payload(void)
 {
-    ULONGLONG n = payload_size();
-    LARGE_INTEGER sz;
-    HANDLE h;
-    BOOL ok = FALSE;
+    WCHAR zip[MAX_PATH], cmd[MAX_PATH * 3], win[MAX_PATH];
+    HANDLE in, out; LARGE_INTEGER sz, li; ULONGLONG n = payload_size(), left;
+    BOOL ok = TRUE;
+    static unsigned char buf[1 << 16];
     post_text(WM_PROGRESS, 1, L"Unpacking Setup's files");
-    h = CreateFileW(g_self, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        if (n && GetFileSizeEx(h, &sz)) {
-            CloseHandle(h);
-            h = INVALID_HANDLE_VALUE;
-            ok = unzip_file(g_self, (ULONGLONG)sz.QuadPart - 16 - n, n, g_root);
-        }
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    SHCreateDirectoryExW(NULL, g_root, NULL);
+    wsprintfW(zip, L"%s\\setup_files.zip", g_root);
+    in = CreateFileW(g_self, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    out = CreateFileW(zip, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (in == INVALID_HANDLE_VALUE || out == INVALID_HANDLE_VALUE || !n || !GetFileSizeEx(in, &sz)) ok = FALSE;
+    if (ok) {
+        li.QuadPart = sz.QuadPart - 16 - (LONGLONG)n;
+        ok = SetFilePointerEx(in, li, NULL, FILE_BEGIN);
     }
-    if (!ok) {
-        WCHAR msg[MAX_PATH + 96];
-        wsprintfW(msg, L"Could not unpack Setup's files into %s. Check that drive has free "
-                       L"space and run Setup again.", g_root);
-        log_line(msg);
+    for (left = n; ok && left; ) {
+        DWORD want = left > sizeof buf ? sizeof buf : (DWORD)left, got = 0, w = 0;
+        ok = ReadFile(in, buf, want, &got, NULL) && got == want && WriteFile(out, buf, got, &w, NULL) && w == got;
+        left -= got;
     }
+    if (in != INVALID_HANDLE_VALUE) CloseHandle(in);
+    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    if (ok) {
+        GetWindowsDirectoryW(win, MAX_PATH);
+        wsprintfW(cmd, L"\"%s\\System32\\tar.exe\" -xf \"%s\" -C \"%s\"", win, zip, g_root);
+        ok = run_wait(cmd, g_root);
+    }
+    DeleteFileW(zip);
+    if (!ok) log_line(L"Could not unpack Setup's files. Check there is free space on drive C: and run Setup again.");
     return ok;
 }
 
 static BOOL ensure_python(WCHAR *pyexe)
 {
-    WCHAR pydir[MAX_PATH], dl[MAX_PATH], zip[MAX_PATH];
+    WCHAR pydir[MAX_PATH], dl[MAX_PATH], zip[MAX_PATH], cmd[MAX_PATH * 3];
     wsprintfW(pydir, L"%s\\_python", g_root);
     wsprintfW(pyexe, L"%s\\python.exe", pydir);
     if (file_exists(pyexe))
@@ -492,8 +419,14 @@ static BOOL ensure_python(WCHAR *pyexe)
             return FALSE;
         }
     }
-    if (!unzip_file(zip, 0, 0, pydir) || !file_exists(pyexe)) {
-        if (!file_exists(pyexe)) log_line(L"python.exe was not among the unpacked files.");
+    CreateDirectoryW(pydir, NULL);
+    /* tar.exe has shipped with Windows since 10 1803 and reads zip files. */
+    {
+        WCHAR win[MAX_PATH];
+        GetWindowsDirectoryW(win, MAX_PATH);
+        wsprintfW(cmd, L"\"%s\\System32\\tar.exe\" -xf \"%s\" -C \"%s\"", win, zip, pydir);
+    }
+    if (!run_wait(cmd, g_root) || !file_exists(pyexe)) {
         DeleteFileW(zip);
         log_line(L"Could not unpack Python. Run Setup again.");
         return FALSE;
@@ -576,26 +509,6 @@ static DWORD WINAPI worker(LPVOID unused)
     WaitForSingleObject(pi.hProcess, INFINITE);
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    if (code == 0 && g_exe[0]) {
-        /* Windows scans a program it has never seen the first time it runs,
-         * and every player's build is new: start it once now (it quits at
-         * once with --prewarm) so that wait happens here, not at first play. */
-        WCHAR pw[MAX_PATH + 32], dir[MAX_PATH];
-        DWORD t0 = GetTickCount();
-        int i;
-        post_text(WM_PROGRESS, 99, L"Preparing the graphics shaders (a few minutes; this makes the first start quick)");
-        log_line(L"Preparing the graphics shaders, so the first start is quick...");
-        lstrcpyW(dir, g_exe);
-        for (i = lstrlenW(dir); i > 0 && dir[i] != L'\\'; i--) ;
-        dir[i] = 0;
-        wsprintfW(pw, L"\"%s\" --prewarm", g_exe);
-        run_wait(pw, dir);
-        {
-            WCHAR msg[96];
-            wsprintfW(msg, L"Shaders ready in %lu seconds.", (GetTickCount() - t0 + 500) / 1000);
-            log_line(msg);
-        }
-    }
     PostMessageW(g_wnd, WM_FINISHED, code == 0 && g_exe[0], 0);
     return 0;
 }

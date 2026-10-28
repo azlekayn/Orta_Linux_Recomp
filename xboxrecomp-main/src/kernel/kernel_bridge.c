@@ -534,7 +534,7 @@ struct bridge_thread_start {
  * for ever on an event only the worker sets (the freeze in the stage-1 ending
  * cutscene). Each thread now gets its own KTHREAD copy with a unique id. */
 static volatile LONG s_guest_tid = 0x100;
-static __declspec(thread) uint32_t t_spawn_tid;
+static XBOX_THREAD_LOCAL uint32_t t_spawn_tid;
 
 static void bridge_give_thread_identity(uint32_t tib, uint32_t tid)
 {
@@ -1951,9 +1951,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
      * the game and render threads get it; the poll's result is unchanged. */
     if (g_eax == 0x102u && timeout_ptr && BRIDGE_MEM32(timeout_ptr) == 0 &&
         BRIDGE_MEM32(timeout_ptr + 4) == 0)
-        recomp_idle_backoff();     /* yields, then 1 ms sleeps while it keeps polling */
-    else
-        recomp_idle_reset();
+        SwitchToThread();
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -2032,11 +2030,6 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
             XBOX_TO_NATIVE(timeout_ptr));
         if (ws) wait_end(ws);
     }
-    if (g_eax == 0x102u && timeout_ptr && BRIDGE_MEM32(timeout_ptr) == 0 &&
-        BRIDGE_MEM32(timeout_ptr + 4) == 0)
-        recomp_idle_backoff();     /* a zero-timeout poll that found nothing */
-    else
-        recomp_idle_reset();
 }
 
 /*
@@ -3166,7 +3159,6 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        recomp_spin_wake();             /* guests polling timers and vblank counts */
         {
             static int legacy = -1;     /* RECOMP_VBLANK_LEGACY=1: the old clock */
             if (legacy < 0) {
@@ -3849,8 +3841,8 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
  * On hardware the APC only runs at the next alertable wait, which is what
  * this queue reproduces. */
 #define APC_QUEUE_MAX 64
-static __declspec(thread) uint32_t t_apc_q[APC_QUEUE_MAX][3];
-static __declspec(thread) int      t_apc_n;
+static XBOX_THREAD_LOCAL uint32_t t_apc_q[APC_QUEUE_MAX][3];
+static XBOX_THREAD_LOCAL int      t_apc_n;
 
 static int apc_inline_mode(void)
 {
@@ -4270,54 +4262,112 @@ static void bridge_NtSetInformationFile(void)
         uint32_t nlen    = BRIDGE_MEM16(info_va + 8);
         uint32_t nbuf    = BRIDGE_MEM32(info_va + 12);
         char     xname[512];
-        WCHAR    newp[MAX_PATH] = {0}, oldp[MAX_PATH] = {0};
-        DWORD    olen;
-        BOOL     ok = FALSE;
         uint32_t i;
 
         if (nlen >= sizeof xname) nlen = sizeof xname - 1;
         for (i = 0; i < nlen; i++) xname[i] = (char)BRIDGE_MEM8(nbuf + i);
         xname[nlen] = 0;
-        olen = handle ? GetFinalPathNameByHandleW(handle, oldp, MAX_PATH,
-                                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) : 0;
-        if (nbuf && olen && olen < MAX_PATH && xname[0] != '\\' && !strchr(xname, ':')) {
-            /* A bare name: rename within the file's own folder. */
-            WCHAR *slash;
-            wcscpy(newp, oldp);
-            slash = wcsrchr(newp, L'\\');
-            if (slash && (size_t)(slash + 1 - newp) + nlen + 1 < MAX_PATH)
-                MultiByteToWideChar(CP_ACP, 0, xname, -1, slash + 1,
-                                    (int)(MAX_PATH - (slash + 1 - newp)));
-            else
-                olen = 0;
-        } else if (!xbox_translate_path(xname, newp, MAX_PATH)) {
-            olen = 0;
-        }
-        if (nbuf && olen && olen < MAX_PATH) {
-            /* Prefer a true rename on the open handle; it needs DELETE access,
-             * so fall back to copying the bytes to the new name. */
-            size_t nb = wcslen(newp);
-            size_t sz = sizeof(FILE_RENAME_INFO) + (nb + 1) * sizeof(WCHAR);
-            FILE_RENAME_INFO *ri = (FILE_RENAME_INFO *)calloc(1, sz);
-            if (ri) {
-                ri->ReplaceIfExists = replace ? TRUE : FALSE;
-                ri->RootDirectory = NULL;
-                ri->FileNameLength = (DWORD)(nb * sizeof(WCHAR));
-                memcpy(ri->FileName, newp, (nb + 1) * sizeof(WCHAR));
-                ok = SetFileInformationByHandle(handle, FileRenameInfo, ri, (DWORD)sz);
-                free(ri);
-            }
-            if (!ok)
-                ok = CopyFileW(oldp, newp, replace ? FALSE : TRUE);
-        }
+
+#if defined(_WIN32)
         {
-            static int logged;
-            if (logged++ < 20) {
-                fprintf(stderr, "  [FILE] rename -> %s : %s (olen=%lu err=%lu old=%S new=%S)\n", xname, ok ? "ok" : "FAILED", (unsigned long)olen, (unsigned long)GetLastError(), olen ? oldp : L"?", newp);
-                fflush(stderr);
+            WCHAR    newp[MAX_PATH] = {0}, oldp[MAX_PATH] = {0};
+            DWORD    olen;
+            BOOL     ok = FALSE;
+
+            olen = handle ? GetFinalPathNameByHandleW(handle, oldp, MAX_PATH,
+                                                      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) : 0;
+            if (nbuf && olen && olen < MAX_PATH && xname[0] != '\\' && !strchr(xname, ':')) {
+                /* A bare name: rename within the file's own folder. */
+                WCHAR *slash;
+                wcscpy(newp, oldp);
+                slash = wcsrchr(newp, L'\\');
+                if (slash && (size_t)(slash + 1 - newp) + nlen + 1 < MAX_PATH)
+                    MultiByteToWideChar(CP_ACP, 0, xname, -1, slash + 1,
+                                        (int)(MAX_PATH - (slash + 1 - newp)));
+                else
+                    olen = 0;
+            } else if (!xbox_translate_path(xname, newp, MAX_PATH)) {
+                olen = 0;
             }
+            if (nbuf && olen && olen < MAX_PATH) {
+                /* Prefer a true rename on the open handle; it needs DELETE access,
+                 * so fall back to copying the bytes to the new name. */
+                size_t nb = wcslen(newp);
+                size_t sz = sizeof(FILE_RENAME_INFO) + (nb + 1) * sizeof(WCHAR);
+                FILE_RENAME_INFO *ri = (FILE_RENAME_INFO *)calloc(1, sz);
+                if (ri) {
+                    ri->ReplaceIfExists = replace ? TRUE : FALSE;
+                    ri->RootDirectory = NULL;
+                    ri->FileNameLength = (DWORD)(nb * sizeof(WCHAR));
+                    memcpy(ri->FileName, newp, (nb + 1) * sizeof(WCHAR));
+                    ok = SetFileInformationByHandle(handle, FileRenameInfo, ri, (DWORD)sz);
+                    free(ri);
+                }
+                if (!ok)
+                    ok = CopyFileW(oldp, newp, replace ? FALSE : TRUE);
+            }
+            {
+                static int logged;
+                if (logged++ < 20) {
+                    fprintf(stderr, "  [FILE] rename -> %s : %s (olen=%lu err=%lu old=%S new=%S)\n", xname, ok ? "ok" : "FAILED", (unsigned long)olen, (unsigned long)GetLastError(), olen ? oldp : L"?", newp);
+                    fflush(stderr);
+                }
+            }
+            g_eax = ok ? 0u : 0xC0000001u;
         }
-        g_eax = ok ? 0u : 0xC0000001u;
+#else
+        {
+            /* POSIX: the open handle knows its host path already, so a bare
+             * name renames within that folder and a full guest path is
+             * translated. A true rename first, then a byte copy (Orta renames
+             * a complete .tmp into place, so either is equivalent). */
+            char oldp[MAX_PATH] = {0}, newp[MAX_PATH] = {0};
+            const char *oldh = handle ? w32_handle_path(handle) : NULL;
+            int ok = 0;
+
+            if (oldh) {
+                snprintf(oldp, sizeof oldp, "%s", oldh);
+                if (nbuf && xname[0] && xname[0] != '\\' && xname[0] != '/' && !strchr(xname, ':')) {
+                    const char *slash = strrchr(oldp, '/');
+                    if (slash && (size_t)(slash + 1 - oldp) + strlen(xname) + 1 < sizeof newp) {
+                        memcpy(newp, oldp, (size_t)(slash + 1 - oldp));
+                        snprintf(newp + (slash + 1 - oldp),
+                                 sizeof newp - (size_t)(slash + 1 - oldp), "%s", xname);
+                    }
+                } else if (!xbox_translate_path(xname, newp, (DWORD)sizeof newp)) {
+                    newp[0] = 0;
+                }
+            }
+            if (oldp[0] && newp[0]) {
+                if (rename(oldp, newp) == 0) {
+                    ok = 1;
+                } else {
+                    FILE *in = fopen(oldp, "rb");
+                    FILE *out = in ? fopen(newp, "wb") : NULL;
+                    if (in && out) {
+                        char buf[65536];
+                        size_t n;
+                        ok = 1;
+                        while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+                            if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+                        }
+                    }
+                    if (in) fclose(in);
+                    if (out) fclose(out);
+                }
+            }
+            {
+                static int logged;
+                if (logged++ < 20) {
+                    fprintf(stderr, "  [FILE] rename -> %s : %s (old=%s new=%s)\n",
+                            xname, ok ? "ok" : "FAILED",
+                            oldp[0] ? oldp : "?", newp[0] ? newp : "?");
+                    fflush(stderr);
+                }
+            }
+            g_eax = ok ? 0u : 0xC0000001u;
+        }
+#endif
         bridge_write_iostatus(ios_va, (NTSTATUS)g_eax, 0);
         return;
     }

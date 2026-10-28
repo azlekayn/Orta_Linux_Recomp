@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
@@ -67,6 +68,10 @@ LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGL
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return cmp;
 }
+
+LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_and_fetch(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedOr(volatile LONG *p, LONG v)  { return __atomic_or_fetch(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedAdd(volatile LONG *p, LONG v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
 
 PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp)
 {
@@ -326,6 +331,30 @@ DWORD GetCurrentThreadId(void)
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
+
+/* Thread id of a thread handle. Windows has one native id per thread; here
+ * the CreateThread object carries the synthetic id GetCurrentThreadId hands
+ * out, and the pseudo "current thread" handle resolves to this thread. */
+DWORD GetThreadId(HANDLE h)
+{
+    w32_object *o;
+    if (!h || h == PSEUDO_CURRENT_PROCESS)
+        return 0;
+    if (h == PSEUDO_CURRENT_THREAD)
+        return GetCurrentThreadId();
+    o = (w32_object *)h;
+    if (o->kind != K_THREAD)
+        return 0;
+    return o->tid;
+}
+
+/* The stack guarantee is a Windows-out of-stack-vs-reserve concern; there is
+ * no POSIX equivalent (the guard page and rlimit are set at thread start). */
+BOOL SetThreadStackGuarantee(PULONG stackSizeInBytes)
+{
+    (void)stackSizeInBytes;
+    return TRUE;
+}
 
 static w32_object *obj_alloc(w32_kind kind)
 {
@@ -750,6 +779,17 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 VOID ExitThread(DWORD exitCode)
 {
     w32_object *o = t_self_obj;
+    /* t_self_obj can be non-NULL but garbage if the thread's TLS block was
+     * clobbered (a guest stack overflow or a wild write). Refuse to deref it,
+     * report it, and still exit the host thread. */
+    if (o && ((uintptr_t)o < 0x10000u || (uintptr_t)o > 0x7f0000000000ull)) {
+        static int said;
+        if (said++ < 12)
+            fprintf(stderr, "[THREAD] ExitThread: bad thread object %p"
+                            " (t_self_obj) -- skipping update, tid=%lu\n",
+                    (void *)o, (unsigned long)GetCurrentThreadId());
+        o = NULL;
+    }
     if (o) {
         pthread_mutex_lock(&o->lock);
         o->exit_code = exitCode;
@@ -764,8 +804,18 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
+    w32_object *o;
+    if (!exitCode) return FALSE;
+    /* Windows accepts GetCurrentThread() (the pseudo-handle) here; resolve it,
+     * and answer STILL_ACTIVE for the process's initial thread (which has no
+     * w32_object of its own). */
+    if (h == PSEUDO_CURRENT_THREAD) {
+        o = t_self_obj;
+        if (!o) { *exitCode = STILL_ACTIVE; return TRUE; }
+    } else {
+        o = (w32_object *)h;
+        if (!o || o->kind != K_THREAD) return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
     pthread_mutex_unlock(&o->lock);
@@ -1442,6 +1492,13 @@ int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type)
     return 1;   /* IDOK */
 }
 
+/* Dynamic loading. There is no in-process Win32 module table on POSIX, so
+ * these resolve nothing. The callers are Windows-only fast paths (a
+ * high-resolution waitable timer, a timer-resolution tweak) that already
+ * fall back when the lookup returns NULL. */
+HMODULE GetModuleHandleA(LPCSTR name) { (void)name; return NULL; }
+void   *GetProcAddress(HMODULE mod, LPCSTR name) { (void)mod; (void)name; return NULL; }
+
 /* Message-loop stubs: no Win32 messages on POSIX (SDL events drive the
  * d3d8_gl backend; this layer is just for the game's Win32 message pump). */
 BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
@@ -1895,25 +1952,199 @@ BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st)
 }
 
 /* ===================================================================== */
-/* Exception handling (compile-shim -- SEH not yet emulated on Linux)     */
+/* Exception handling                                                     */
+/*                                                                        */
+/* Windows has both SEH (__try/__except) and VEH (a process-wide chain of  */
+/* handlers). The recompiled runtime only uses VEH: the MMIO decoders for  */
+/* the APU and NV2A, the AC'97 write trap, and the game target's own crash */
+/* reporter all register through AddVectoredExceptionHandler. On POSIX the */
+/* same chain is driven from a sigaction handler, so those callbacks are   */
+/* unchanged: a SIGSEGV/SIGBUS becomes EXCEPTION_ACCESS_VIOLATION, a       */
+/* SIGTRAP becomes EXCEPTION_SINGLE_STEP (which the AC'97 trap needs), and */
+/* the ucontext_t register file is presented as the CONTEXT the decoders   */
+/* already speak.                                                          */
 /* ===================================================================== */
 
 VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue)
 {
     (void)TargetFrame; (void)TargetIp; (void)ExceptionRecord; (void)ReturnValue;
-    /* TODO: Windows SEH unwinding is not yet emulated on Linux. */
+    /* Windows SEH unwinding is not emulated on Linux. */
 }
 
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
 {
     (void)flags; (void)nargs; (void)args;
     fprintf(stderr, "[win32_compat] RaiseException(0x%08X): SEH not emulated\n", code);
-    /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
+    /* On Windows this does not return; SEH dispatch is unimplemented. */
 }
 
+/* ---- VEH chain -------------------------------------------------------- */
+
+#define W32_MAX_VEH 32
+static PVECTORED_EXCEPTION_HANDLER s_veh[W32_MAX_VEH];
+static int s_veh_count;
+static pthread_mutex_t s_veh_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#if defined(__x86_64__) && !defined(__APPLE__)
+
+static void w32_ctx_from_uctx(XBOX_CONTEXT *c, ucontext_t *uc)
+{
+    greg_t *g = uc->uc_mcontext.gregs;
+    memset(c, 0, sizeof *c);
+    c->Rax = (uint64_t)g[REG_RAX]; c->Rcx = (uint64_t)g[REG_RCX];
+    c->Rdx = (uint64_t)g[REG_RDX]; c->Rbx = (uint64_t)g[REG_RBX];
+    c->Rsp = (uint64_t)g[REG_RSP]; c->Rbp = (uint64_t)g[REG_RBP];
+    c->Rsi = (uint64_t)g[REG_RSI]; c->Rdi = (uint64_t)g[REG_RDI];
+    c->R8  = (uint64_t)g[REG_R8];  c->R9  = (uint64_t)g[REG_R9];
+    c->R10 = (uint64_t)g[REG_R10]; c->R11 = (uint64_t)g[REG_R11];
+    c->R12 = (uint64_t)g[REG_R12]; c->R13 = (uint64_t)g[REG_R13];
+    c->R14 = (uint64_t)g[REG_R14]; c->R15 = (uint64_t)g[REG_R15];
+    c->Rip = (uint64_t)g[REG_RIP];
+    c->EFlags = (uint32_t)g[REG_EFL];
+}
+
+static void w32_uctx_from_ctx(ucontext_t *uc, const XBOX_CONTEXT *c)
+{
+    greg_t *g = uc->uc_mcontext.gregs;
+    g[REG_RAX] = (greg_t)c->Rax; g[REG_RCX] = (greg_t)c->Rcx;
+    g[REG_RDX] = (greg_t)c->Rdx; g[REG_RBX] = (greg_t)c->Rbx;
+    g[REG_RSP] = (greg_t)c->Rsp; g[REG_RBP] = (greg_t)c->Rbp;
+    g[REG_RSI] = (greg_t)c->Rsi; g[REG_RDI] = (greg_t)c->Rdi;
+    g[REG_R8]  = (greg_t)c->R8;  g[REG_R9]  = (greg_t)c->R9;
+    g[REG_R10] = (greg_t)c->R10; g[REG_R11] = (greg_t)c->R11;
+    g[REG_R12] = (greg_t)c->R12; g[REG_R13] = (greg_t)c->R13;
+    g[REG_R14] = (greg_t)c->R14; g[REG_R15] = (greg_t)c->R15;
+    g[REG_RIP] = (greg_t)c->Rip;
+    g[REG_EFL] = (greg_t)c->EFlags;
+}
+
+static void w32_dispatch(int sig, siginfo_t *si, void *vctx)
+{
+    ucontext_t *uc = (ucontext_t *)vctx;
+    XBOX_CONTEXT ctx;
+    EXCEPTION_RECORD rec;
+    EXCEPTION_POINTERS ep;
+    PVECTORED_EXCEPTION_HANDLER hs[W32_MAX_VEH];
+    int n, i;
+
+    w32_ctx_from_uctx(&ctx, uc);
+
+    memset(&rec, 0, sizeof rec);
+    switch (sig) {
+    case SIGSEGV:
+    case SIGBUS:
+        rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        rec.NumberParameters = 2;
+        /* Windows sets ExceptionInformation[0] to 1 for a write. glibc only
+         * reports SEGV_ACCERR (a protection violation) vs SEGV_MAPERR (no
+         * mapping). A protection fault on a page that was made read-only is a
+         * write (that is exactly the AC'97 trap), so ACCERR maps to write.
+         * The MMIO decoders read the opcode anyway and ignore this flag. */
+        rec.ExceptionInformation[0] = (si && si->si_code == SEGV_ACCERR) ? 1 : 0;
+        rec.ExceptionInformation[1] = (ULONG_PTR)(si ? si->si_addr : NULL);
+        break;
+    case SIGTRAP:
+        rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
+        break;
+    case SIGFPE:
+        rec.ExceptionCode = EXCEPTION_FLT_DIVIDE_BY_ZERO;
+        break;
+    case SIGILL:
+    default:
+        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        break;
+    }
+    rec.ExceptionAddress = (PVOID)(uintptr_t)ctx.Rip;
+
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = &ctx;
+
+    pthread_mutex_lock(&s_veh_lock);
+    n = s_veh_count;
+    memcpy(hs, s_veh, sizeof(hs[0]) * (size_t)n);
+    pthread_mutex_unlock(&s_veh_lock);
+
+    for (i = 0; i < n; i++) {
+        LONG r = hs[i](&ep);
+        if (r == EXCEPTION_CONTINUE_EXECUTION) {
+            w32_uctx_from_ctx(uc, &ctx);
+            return;                     /* resume the faulting instruction's context */
+        }
+        if (r == EXCEPTION_EXECUTE_HANDLER)
+            break;
+    }
+
+    /* Unhandled. An unclaimed single-step must not re-trap forever, so clear
+     * the trap flag and carry on; anything else is a real fault, so hand it
+     * back to the kernel to report. */
+    if (sig == SIGTRAP) {
+        uc->uc_mcontext.gregs[REG_EFL] &= ~(greg_t)0x100;
+        return;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void w32_install_signal_handlers(void)
+{
+    static int done;
+    struct sigaction sa;
+    if (__atomic_exchange_n(&done, 1, __ATOMIC_SEQ_CST))
+        return;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = w32_dispatch;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+}
+
+#else /* not x86-64: no register file to present, so no VEH dispatch */
+
+static void w32_install_signal_handlers(void) {}
+
+#endif
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
-ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+{
+    if (!Handler)
+        return NULL;
+    pthread_mutex_lock(&s_veh_lock);
+    if (s_veh_count < W32_MAX_VEH) {
+        if (First) {
+            memmove(&s_veh[1], &s_veh[0], sizeof(s_veh[0]) * (size_t)s_veh_count);
+            s_veh[0] = Handler;
+        } else {
+            s_veh[s_veh_count] = Handler;
+        }
+        s_veh_count++;
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    w32_install_signal_handlers();
+    /* Non-NULL token; RemoveVectoredExceptionHandler compares it by value. */
+    return (PVOID)(uintptr_t)Handler;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    PVECTORED_EXCEPTION_HANDLER H = (PVECTORED_EXCEPTION_HANDLER)(uintptr_t)h;
+    int i;
+    pthread_mutex_lock(&s_veh_lock);
+    for (i = 0; i < s_veh_count; i++) {
+        if (s_veh[i] == H) {
+            memmove(&s_veh[i], &s_veh[i + 1],
+                    sizeof(s_veh[0]) * (size_t)(s_veh_count - i - 1));
+            s_veh_count--;
+            pthread_mutex_unlock(&s_veh_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&s_veh_lock);
+    return 0;
+}
 
 #endif /* !_WIN32 */

@@ -28,7 +28,9 @@ static int g_mmio_decode_fail = 0;
  * (regardless of whether the MMIO hook is active). Keep its definition
  * outside the Win32 guard. */
 
-#if defined(_WIN32)
+/* The decoder is shared. On Windows PCONTEXT is the real CONTEXT; on POSIX the
+ * sigaction dispatcher in win32_compat.c presents the same field names, so
+ * both hosts run this one implementation. */
 
 /* ============================================================
  * x86-64 register access helpers
@@ -416,17 +418,3 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
     }
     return false;
 }
-
-#else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
-
-void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
-{ (void)xbox_mem_offset; }
-
-bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
-                           uint32_t fault_xbox_va, int is_write)
-{ (void)ctx; (void)fault_addr; (void)fault_xbox_va; (void)is_write; return false; }
-
-bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
-{ (void)fault_addr; (void)fault_xbox_va; return false; }
-
-#endif /* _WIN32 */

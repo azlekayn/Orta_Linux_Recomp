@@ -13,6 +13,11 @@ add_library(xbox_apu STATIC
     apu_xaudio2.c
 )
 
+# Linux: the APU monitor's waveOut surface is backed by SDL2 audio.
+if(NOT WIN32)
+    target_sources(xbox_apu PRIVATE apu_sdl_audio.c)
+endif()
+
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction

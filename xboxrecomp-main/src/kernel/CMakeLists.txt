@@ -33,6 +33,12 @@ set(KERNEL_SOURCES
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
+# POSIX: the OpenGL back end for the push-buffer executor (nv2a_gpu.c's
+# D3D11 branch has no POSIX equivalent).
+if(NOT WIN32)
+    target_sources(xbox_kernel PRIVATE nv2a_gpu_gl.c)
+endif()
+
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
@@ -47,9 +53,15 @@ if(WIN32)
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
 else()
-    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
+    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto,
+    # and SDL2 + libepoxy for the OpenGL push-buffer back end.
     find_package(OpenSSL REQUIRED)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    find_package(SDL2 REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(EPOXY REQUIRED epoxy)
+    target_include_directories(xbox_kernel PRIVATE ${EPOXY_INCLUDE_DIRS})
+    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto
+        SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
 endif()
 
 if(MSVC)

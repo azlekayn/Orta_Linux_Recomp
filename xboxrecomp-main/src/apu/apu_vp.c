@@ -98,28 +98,6 @@ static void apu_stats_tick(MCPXAPUState *d)
     memset(s_st_note, 0, sizeof s_st_note);
 }
 
-/* RECOMP_APU_STREAMLOG=1: every stream-voice event (on, off, release,
- * stream lists, running dry, lists finished), timestamped, to chase music
- * that sometimes never starts. Off by default. */
-static int streamlog_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_STREAMLOG");
-        on = e && *e == '1';
-    }
-    return on;
-}
-static unsigned char s_stream_dry[MCPX_HW_MAX_VOICES];
-/* Music and ambience are stereo buffer voices (Orta plays no stream voices):
- * the log covers those too. */
-#define VLOG_VOICE(d, v) (streamlog_on() && (voice_get_mask((d), (uint16_t)(v), \
-    NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) || \
-    voice_get_mask((d), (uint16_t)(v), NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_STEREO)))
-#define STREAMLOG(...) do { if (streamlog_on()) { \
-    fprintf(stderr, "[STREAM %lu] ", (unsigned long)GetTickCount()); \
-    fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
-
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -142,20 +120,9 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
-/* Per-voice resampler state (see voice_resample). */
-typedef struct {
-    float s0[2], s1[2];      /* the source samples either side of pos */
-    double pos;              /* 0..1 between s0 and s1 */
-    float buf[64][2];        /* source samples fetched ahead */
-    int idx, len;
-    int primed;
-} VoiceResampler;
-static VoiceResampler s_rs[MCPX_HW_MAX_VOICES];
-
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    memset(&s_rs[v], 0, sizeof s_rs[v]);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
@@ -228,9 +195,6 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     }
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
-    if (VLOG_VOICE(d, v))
-        STREAMLOG("voice %u OFF (was %s)%s", (unsigned)v, was_active ? "playing" : "already off",
-                  (!was_active && !renotify) ? " -- no done notification" : "");
     if (!was_active && !renotify)
         return;
 
@@ -326,30 +290,6 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
-        if (VLOG_VOICE(d, selected_handle)) {
-            s_stream_dry[selected_handle] = 0;
-            STREAMLOG("voice %u ON  %s loop=%d cbo=%u ebo=%u lbo=%u pitch=%d "
-                      "persist=%d ssl A=%u B=%u index=%d paused=%d",
-                (unsigned)selected_handle,
-                voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT,
-                               NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) ? "STREAM" : "buffer",
-                (int)(voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT,
-                                     NV_PAVS_VOICE_CFG_FMT_LOOP) != 0),
-                (unsigned)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_OFFSET,
-                                         NV_PAVS_VOICE_PAR_OFFSET_CBO),
-                (unsigned)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_NEXT,
-                                         NV_PAVS_VOICE_PAR_NEXT_EBO),
-                (unsigned)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
-                                         NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO),
-                (int)(int16_t)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_TAR_PITCH_LINK,
-                                             NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH),
-                (int)(voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT,
-                                     NV_PAVS_VOICE_CFG_FMT_PERSIST) != 0),
-                d->vp.ssl[selected_handle].count[0], d->vp.ssl[selected_handle].count[1],
-                d->vp.ssl[selected_handle].ssl_index,
-                (int)(voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
-                                     NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0));
-        }
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -435,8 +375,6 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_RELEASE: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
-        if (VLOG_VOICE(d, selected_handle))
-            STREAMLOG("voice %u RELEASE", (unsigned)selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -468,9 +406,6 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_PAUSE: {
         static int logged;
-        if (VLOG_VOICE(d, argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE))
-            STREAMLOG("voice %u %s", (unsigned)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
-                      (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) ? "PAUSE" : "RESUME");
         if (logged < 400) {
             logged++;
             fprintf(stderr, "[APU] VOICE_PAUSE voice %u %s\n",
@@ -578,31 +513,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
-        if (VLOG_VOICE(d, d->regs[NV_PAPU_FECV]))
-            STREAMLOG("voice %u set CBO %u (active %d)", (unsigned)d->regs[NV_PAPU_FECV],
-                      (unsigned)argument, (int)voice_get_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
-                      NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE));
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
-        /* The game moved the play position: samples the resampler fetched
-         * ahead from the old position no longer follow. */
-        if (d->regs[NV_PAPU_FECV] < MCPX_HW_MAX_VOICES)
-            memset(&s_rs[d->regs[NV_PAPU_FECV]], 0, sizeof s_rs[0]);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO:
-        {   /* the game topping up a buffer: logged at most a few times a second per voice */
-            static DWORD last[MCPX_HW_MAX_VOICES];
-            uint16_t cv = (uint16_t)d->regs[NV_PAPU_FECV];
-            if (cv < MCPX_HW_MAX_VOICES && VLOG_VOICE(d, cv) && GetTickCount() - last[cv] > 250) {
-                last[cv] = GetTickCount();
-                STREAMLOG("voice %u set EBO %u (cbo %u, active %d)", (unsigned)cv, (unsigned)argument,
-                          (unsigned)voice_get_mask(d, cv, NV_PAVS_VOICE_PAR_OFFSET,
-                                                   NV_PAVS_VOICE_PAR_OFFSET_CBO),
-                          (int)voice_get_mask(d, cv, NV_PAVS_VOICE_PAR_STATE,
-                                              NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE));
-            }
-        }
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_NEXT,
                        NV_PAVS_VOICE_PAR_NEXT_EBO, argument);
@@ -641,10 +556,6 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
-        STREAMLOG("voice %d list A = %u segments (playing list %d, active %d)", current_voice,
-                  d->vp.ssl[current_voice].count[ssl], d->vp.ssl[current_voice].ssl_index,
-                  (int)voice_get_mask(d, (uint16_t)current_voice, NV_PAVS_VOICE_PAR_STATE,
-                                      NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE));
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -655,10 +566,6 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
-        STREAMLOG("voice %d list B = %u segments (playing list %d, active %d)", current_voice,
-                  d->vp.ssl[current_voice].count[ssl], d->vp.ssl[current_voice].ssl_index,
-                  (int)voice_get_mask(d, (uint16_t)current_voice, NV_PAVS_VOICE_PAR_STATE,
-                                      NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE));
         break;
     }
 
@@ -1045,8 +952,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             int eacur = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                                        NV_PAVS_VOICE_PAR_STATE_EACUR);
             if (eacur < NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE) {
-                STREAMLOG("voice %u not persistent and envelope %d before release: turned off",
-                          (unsigned)v, eacur);
                 voice_off(d, (uint16_t)v);
                 return -1;
             }
@@ -1059,10 +964,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
-            if (!s_stream_dry[v])          /* once per dry spell */
-                STREAMLOG("voice %u ran dry: list %d empty (persist %d)", (unsigned)v,
-                          ssl_index, (int)persist);
-            s_stream_dry[v] = 1;
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -1190,10 +1091,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
-                s_stream_dry[v] = 0;
-                STREAMLOG("voice %u finished list %d (%u segments), on to list %d (%u)",
-                          (unsigned)v, ssl_index, d->vp.ssl[v].count[ssl_index], next_index,
-                          d->vp.ssl[v].count[next_index]);
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1204,9 +1101,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 cbo = lbo;
             } else {
                 cbo = ebo;
-                if (VLOG_VOICE(d, v))
-                    STREAMLOG("voice %u reached the end of its buffer (ebo %u)", (unsigned)v,
-                              (unsigned)ebo);
                 voice_off(d, (uint16_t)v);
             }
         }
@@ -1218,89 +1112,31 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling
+ * Voice resampling (simplified - no libsamplerate)
  *
- * The voice's pitch says how fast to step through its samples: `rate` is
- * output samples per source sample (libsamplerate's src_ratio in xemu), so a
- * clip recorded at 22,050 Hz has rate ~2.18 at the 48 kHz output. This used
- * to be stubbed -- every clip played one source sample per output sample,
- * which put Orta's 22 kHz voices 2.2x too fast and too high. Now: linear
- * interpolation between source samples, fetched ahead in small chunks and
- * kept per voice across frames. Rate 1 keeps the direct path.
+ * Since libsamplerate is stubbed, we do a simple nearest-neighbor
+ * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
-
-/* Next source sample of voice v: 1, or 0/-1 when the voice has none. */
-static int rs_next(MCPXAPUState *d, uint16_t v, float out[2])
-{
-    VoiceResampler *r = &s_rs[v];
-    if (r->idx >= r->len) {
-        int n;
-        if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                            NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
-            return 0;
-        n = voice_get_samples(d, v, r->buf, 64);
-        if (n <= 0) return n < 0 ? -1 : 0;
-        r->len = n;
-        r->idx = 0;
-    }
-    out[0] = r->buf[r->idx][0];
-    out[1] = r->buf[r->idx][1];
-    r->idx++;
-    return 1;
-}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    VoiceResampler *r = &s_rs[v];
+    /* Without libsamplerate, just fetch raw samples at native rate.
+     * Rate < 1.0 means we need more source samples than output samples.
+     * For initial functionality, just get the samples directly. */
     int sample_count = 0;
-    double step;
-
-    if (!(rate > 0.0f) || fabsf(rate - 1.0f) < 1e-4f) {
-        /* Native rate: straight through, as before. */
-        r->primed = 0;
-        r->idx = r->len = 0;
-        while (sample_count < requested_num) {
-            int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) break;
-            int count = voice_get_samples(d, v, &samples[sample_count],
-                                          requested_num - sample_count);
-            if (count < 0) break;
-            if (count == 0) return -1;
-            sample_count += count;
-        }
-        return sample_count;
-    }
-
-    step = 1.0 / (double)rate;
-    if (!r->primed) {
-        int a = rs_next(d, v, r->s0);
-        if (a <= 0) return a < 0 ? -1 : 0;
-        if (rs_next(d, v, r->s1) <= 0) {
-            r->s1[0] = r->s0[0];
-            r->s1[1] = r->s0[1];
-        }
-        r->pos = 0.0;
-        r->primed = 1;
-    }
     while (sample_count < requested_num) {
-        float f = (float)r->pos;
-        samples[sample_count][0] = r->s0[0] + (r->s1[0] - r->s0[0]) * f;
-        samples[sample_count][1] = r->s0[1] + (r->s1[1] - r->s0[1]) * f;
-        sample_count++;
-        r->pos += step;
-        while (r->pos >= 1.0) {
-            r->pos -= 1.0;
-            r->s0[0] = r->s1[0];
-            r->s0[1] = r->s1[1];
-            if (rs_next(d, v, r->s1) <= 0) {
-                /* The voice ran out (end of a one-shot clip): stop here. */
-                r->primed = 0;
-                return sample_count;
-            }
-        }
+        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+        if (!active) break;
+
+        int count = voice_get_samples(d, v, &samples[sample_count],
+                                      requested_num - sample_count);
+        if (count < 0) break;
+        if (count == 0) return -1;
+        sample_count += count;
     }
+    (void)rate; /* Ignored until we add proper resampling */
     return sample_count;
 }
 

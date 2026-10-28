@@ -485,10 +485,157 @@ translate:
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <dirent.h>
+#include <strings.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
 static BOOL s_initialized = FALSE;
+
+/* The raw disk device, \Device\Harddisk0\Partition0.
+ *
+ * A title opens it to read the Xbox partition table at sector 4 (offset 0x800)
+ * and find the cache partitions behind X:, Y: and Z:. Orta's XAPI utility-drive
+ * mount does exactly this and calls HalReturnToFirmware when the read fails, so
+ * without a device to back it the title quits to the dashboard before it draws
+ * anything. The Windows backend backs it with an image file; so does this one.
+ *
+ * The table is the standard retail geometry -- emulating a device that has to
+ * be there, not fabricating anything the title owns. */
+#define XBOX_DISK_IMAGE_NAME   "Partition0.img"
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+
+static void put_le32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static void xbox_write_partition_table(const char *path)
+{
+    /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
+    static const struct { const char *name; uint32_t start, size; } parts[] = {
+        { "XBOX_PART_X",  0x00000400u, 0x00177000u },  /* X: cache      */
+        { "XBOX_PART_Y",  0x00177400u, 0x00177000u },  /* Y: cache      */
+        { "XBOX_PART_Z",  0x002EE400u, 0x00177000u },  /* Z: cache      */
+        { "XBOX_PART_C",  0x00465400u, 0x000FA000u },  /* C: system     */
+        { "XBOX_PART_E",  0x0055F400u, 0x00465400u },  /* E: game/save  */
+    };
+    unsigned char sector[512];
+    FILE *f;
+    size_t i;
+
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+
+    memset(sector, 0, sizeof(sector));
+    memcpy(sector, "****PARTINFO****", 16);
+    for (i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *e = sector + 48 + i * 32;   /* 16 magic + 32 reserved */
+        size_t n = strlen(parts[i].name);
+        memset(e, ' ', 16);
+        memcpy(e, parts[i].name, n < 16 ? n : 16);
+        put_le32(e + 16, XBOX_PART_IN_USE);
+        put_le32(e + 20, parts[i].start);
+        put_le32(e + 24, parts[i].size);
+        put_le32(e + 28, 0);
+    }
+
+    if (fseek(f, XBOX_PART_TABLE_OFFSET, SEEK_SET) == 0)
+        fwrite(sector, 1, sizeof(sector), f);
+    fclose(f);
+}
+
+/* Map a bare partition device onto an image file. Matches
+ * "\Device\Harddisk0\PartitionN" with *nothing* after it, which is how the raw
+ * device is opened (a title reads the partition table from Partition0 at sector
+ * 4). A trailing separator means the filesystem root of a partition -- Orta
+ * opens "\Device\Harddisk0\Partition1\" as its game/save volume -- and that is
+ * an ordinary directory access for the rules table, not a raw device. */
+static int xbox_partition_device_path(const char *xbox_path, char *out, size_t n)
+{
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int len = match_prefix(xbox_path, prefix);
+    char digit;
+    const char *rest;
+
+    if (!len)
+        return 0;
+    digit = xbox_path[len];
+    if (digit < '0' || digit > '9')
+        return 0;
+    rest = xbox_path + len + 1;
+    if (*rest != '\0')
+        return 0;
+
+    snprintf(out, n, "%s/Partition%c.img", s_save_dir, digit);
+    return 1;
+}
+
+/* Rewrite `path` in place so every component matches the on-disk case, but
+ * only when the exact path does not already exist. Each missing component is
+ * looked up in its parent directory with strcasecmp; if any component has no
+ * case-insensitive match the path is left alone (so a genuinely new file, or a
+ * missing one, is not turned into something else). */
+static void resolve_case(char *path)
+{
+    char resolved[MAX_PATH];
+    struct stat st;
+    const char *src = path;
+    char *dst = resolved;
+
+    if (stat(path, &st) == 0)
+        return;
+
+    resolved[0] = '\0';
+    if (*src == '/') {
+        *dst++ = '/';
+        *dst = '\0';
+        src++;
+    }
+
+    while (*src) {
+        char comp[256];
+        size_t n = 0;
+        struct dirent *e;
+        DIR *d;
+        int found = 0;
+
+        while (*src && *src != '/' && n < sizeof(comp) - 1)
+            comp[n++] = *src++;
+        comp[n] = '\0';
+        if (*src == '/')
+            src++;
+
+        if (!comp[0])
+            continue;
+
+        d = opendir(resolved[0] ? resolved : ".");
+        if (d) {
+            while ((e = readdir(d)) != NULL) {
+                if (strcasecmp(e->d_name, comp) == 0) {
+                    size_t rl = strlen(resolved);
+                    snprintf(resolved + rl, sizeof(resolved) - rl, "%s%s",
+                             (rl && resolved[rl - 1] != '/') ? "/" : "",
+                             e->d_name);
+                    found = 1;
+                    break;
+                }
+            }
+            closedir(d);
+        }
+        if (!found)
+            return;
+    }
+
+    snprintf(path, MAX_PATH, "%s", resolved);
+}
 
 /* Strip a single trailing '/' (but never the root '/'). */
 static void strip_trailing_slash(char* s)
@@ -517,6 +664,38 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+/* Create the parent directory of a host file path, but only inside the
+ * writable save tree. A title copying disc assets into its cache opens
+ * "<cache>/a/b/c.tmp"; POSIX open() does not create the intermediate
+ * directories (nor does Win32 CreateFileW), so without this the copy fails and
+ * the title retries forever. Restricted to save_dir so a probe against the
+ * (read-only) game tree never litters it. */
+void xbox_path_make_parent(const char *host_path)
+{
+    char dir[MAX_PATH];
+    size_t n, slen;
+
+    if (!host_path || !host_path[0])
+        return;
+
+    snprintf(dir, sizeof(dir), "%s", host_path);
+    n = strlen(dir);
+    while (n > 0 && dir[n - 1] != '/')
+        n--;
+    if (n == 0)
+        return;                       /* no directory part */
+    dir[n - 1] = '\0';                /* strip the trailing slash */
+    if (!dir[0] || !s_save_dir[0])
+        return;
+
+    slen = strlen(s_save_dir);
+    if (strncmp(dir, s_save_dir, slen) != 0
+            || (dir[slen] != '\0' && dir[slen] != '/'))
+        return;                       /* outside the save tree */
+
+    mkdir_p(dir);
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -548,6 +727,48 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
 
+    /* Create the save-side directories and the partition images. T:/U:/Z: map
+     * into subdirectories of save_dir, and a title that opens a file there with
+     * a create disposition fails if the parent does not exist. The partition
+     * images back the \Device\Harddisk0\PartitionN devices (see above). Cheap
+     * and idempotent. */
+    {
+        static const char *subs[] = { "TitleData", "UserData", "Cache", "SystemData" };
+        static const unsigned long long part_sectors[6] = {
+            0,              /* 0: whole disk          */
+            0x00465400ull,  /* 1: E: game and saves   */
+            0x000FA000ull,  /* 2: C: system           */
+            0x00177000ull,  /* 3: X: cache            */
+            0x00177000ull,  /* 4: Y: cache            */
+            0x00177000ull,  /* 5: Z: cache            */
+        };
+        char path[MAX_PATH];
+        int i;
+
+        mkdir_p(s_save_dir);
+        for (i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
+            snprintf(path, sizeof(path), "%s/%s", s_save_dir, subs[i]);
+            mkdir_p(path);
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
+        xbox_write_partition_table(path);
+
+        /* The other partition devices, sized to the same geometry the table
+         * describes, so a title that asks the device how big it is gets an
+         * answer consistent with the table it just read. Sparse: the cache
+         * partitions are 750 MB each and none of it is touched until written. */
+        for (i = 1; i <= 5; i++) {
+            int fd;
+            snprintf(path, sizeof(path), "%s/Partition%d.img", s_save_dir, i);
+            fd = open(path, O_CREAT | O_RDWR, 0644);
+            if (fd >= 0) {
+                (void)ftruncate(fd, (off_t)(part_sectors[i] * 512ull));
+                close(fd);
+            }
+        }
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
@@ -571,6 +792,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
+
+    /* A bare \Device\Harddisk0\PartitionN is a raw device, backed by an image
+     * file, not a directory. Checked before the rules so a partition device is
+     * not mistaken for a filesystem path. */
+    if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size))
+        return TRUE;
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
         skip = match_prefix(xbox_path, s_rules[i].prefix);
@@ -615,6 +842,12 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+
+        /* Xbox paths are case-insensitive (FATX/NTFS); Linux is not. A file
+         * the title names with different case than the disc recorded would
+         * otherwise fail to open, so match the on-disk case component by
+         * component when the exact path does not exist. */
+        resolve_case(host_path_buf);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;

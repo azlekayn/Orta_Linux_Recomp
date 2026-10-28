@@ -1192,7 +1192,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *get = s_gpu_get_va ? (s_gpu_get_va & 0x0FFFFFFFu) : put;
                     s_get_written = *get;
                     s_get_written_valid = 1;
-                    recomp_spin_wake();    /* a guest may be polling GET */
                 }
                 /* PUT stuck for 5 s: show what the title's D3D is waiting
                  * on -- its own idea of the ring (device fields) beside the
@@ -1364,15 +1363,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         }
 
         xbox_PtimerUpdate();
-        {
-            /* Nothing submitted that has not been executed: rest instead of
-             * going straight round (this loop was a whole core at 100% on a
-             * title screen). KickOff (the PFB trap) and any guest polling
-             * for the GPU wake it at once. */
-            uint32_t p = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            uint32_t g = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            recomp_exec_idle(((p ^ g) & 0x0FFFFFFFu) == 0);
-        }
+        Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
 }
@@ -1460,83 +1451,6 @@ static void pcrtc_arm_write_trap(void)
  * tick tied the two together: every KickOff waited for whatever segment the
  * executor was drawing, so the game and the GPU took turns instead of
  * overlapping -- the profile had the game thread 80% inside that spin. */
-/*
- * That thread spun on the register non-stop, which cost a whole CPU core for
- * the life of the game: on a quad-core laptop, a quarter of the machine.
- * Now the PFB page is write-trapped like PCRTC above: a guest write faults,
- * is single-stepped, and the flush bit is cleared the moment it is set, so
- * KickOff never waits and nothing spins. The thread stays as a backstop
- * (a write made while another thread is mid-step goes untrapped) but sleeps
- * 1 ms between looks. RECOMP_FAST_FLUSH=2 brings the old spinning thread
- * back. */
-static char *g_pfb_page;
-static volatile LONG g_pfb_traps, g_pfb_backstop;
-static RECOMP_TLS int s_pfb_stepping;
-
-static LONG CALLBACK pfb_write_veh(PEXCEPTION_POINTERS ep)
-{
-    DWORD code = ep->ExceptionRecord->ExceptionCode, old;
-    if (!g_pfb_page)
-        return EXCEPTION_CONTINUE_SEARCH;
-    if (code == EXCEPTION_SINGLE_STEP && s_pfb_stepping) {
-        volatile uint32_t *flush = (volatile uint32_t *)(g_pfb_page + 0x410);
-        s_pfb_stepping = 0;
-        if (*flush & 0x00010000u) {
-            InterlockedAnd((volatile LONG *)flush, ~0x00010000);
-            recomp_exec_kick();        /* KickOff: new GPU work is coming */
-        }
-        VirtualProtect(g_pfb_page, 0x1000, PAGE_READONLY, &old);
-        ep->ContextRecord->EFlags &= ~0x100u;
-        InterlockedIncrement(&g_pfb_traps);
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    if (code == EXCEPTION_ACCESS_VIOLATION
-            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
-        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
-        if (fault >= (uintptr_t)g_pfb_page && fault < (uintptr_t)g_pfb_page + 0x1000) {
-            if (!VirtualProtect(g_pfb_page, 0x1000, PAGE_READWRITE, &old))
-                return EXCEPTION_CONTINUE_SEARCH;
-            s_pfb_stepping = 1;
-            ep->ContextRecord->EFlags |= 0x100u;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-static int pfb_arm_write_trap(void)
-{
-    DWORD old;
-    g_pfb_page = (char *)g_nv2a_memory + 0x100000;
-    if (!AddVectoredExceptionHandler(1, pfb_write_veh)
-            || !VirtualProtect(g_pfb_page, 0x1000, PAGE_READONLY, &old)) {
-        g_pfb_page = NULL;
-        return 0;
-    }
-    return 1;
-}
-
-static DWORD WINAPI nv2a_flush_backstop_thread(LPVOID param)
-{
-    volatile uint32_t *r = (volatile uint32_t *)((char *)param + 0x100410);
-    DWORD last = GetTickCount();
-    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        if (*r & 0x00010000u) {
-            InterlockedAnd((volatile LONG *)r, ~0x00010000);
-            InterlockedIncrement(&g_pfb_backstop);
-        }
-        if (GetTickCount() - last >= 10000) {
-            last = GetTickCount();
-            if (!recomp_diag_quiet())
-                fprintf(stderr, "  [FLUSH] last 10 s: %ld KickOff flushes trapped, %ld caught by"
-                                " the backstop\n", InterlockedExchange(&g_pfb_traps, 0),
-                        InterlockedExchange(&g_pfb_backstop, 0));
-        }
-        Sleep(1);
-    }
-    return 0;
-}
-
 static DWORD WINAPI nv2a_flush_ack_thread(LPVOID param)
 {
     volatile uint32_t *r = (volatile uint32_t *)((char *)param + 0x100410);
@@ -1585,14 +1499,10 @@ static void xbox_Nv2aAckStart(void)
     {
         const char *e = getenv("RECOMP_FAST_FLUSH");
         if (e && *e && strcmp(e, "0")) {
-            int trapped = strcmp(e, "2") != 0 && pfb_arm_write_trap();
-            HANDLE h = CreateThread(NULL, 0, trapped ? nv2a_flush_backstop_thread
-                                                     : nv2a_flush_ack_thread,
-                                    g_nv2a_memory, 0, NULL);
+            HANDLE h = CreateThread(NULL, 0, nv2a_flush_ack_thread, g_nv2a_memory, 0, NULL);
             if (h) {
                 CloseHandle(h);
-                fprintf(stderr, "  NV2A: fast flush ack on (%s)\n",
-                        trapped ? "PFB write trap, no spinning thread" : "spinning thread");
+                fprintf(stderr, "  NV2A: fast flush ack on (KickOff no longer waits for the executor)\n");
             }
         }
     }
@@ -2136,6 +2046,13 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
             fprintf(stderr, " %08X",
                     g_icall_trace[(g_icall_trace_idx + k) & 15]);
         fprintf(stderr, "\n");
+    }
+    /* On Windows the profiler prints the blocked-thread census; it is stubbed
+     * on POSIX, so ask for it here or a Linux hang has no wait diagnosis. */
+    {
+        extern void (*g_recomp_dump_waits)(void);
+        if (g_recomp_dump_waits)
+            g_recomp_dump_waits();
     }
     /* Guest globals worth seeing at the moment of the hang.
      *

@@ -73,6 +73,22 @@ Python 3.
 The toolkit's own guide, `xboxrecomp-main/docs/GETTING_STARTED.md`, explains
 the pipeline in depth.
 
+## Building and playing on Linux
+
+A native Linux build is supported (OpenGL 3.3 + SDL2 instead of Direct3D 11,
+SDL2 gamepad, an OpenGL F1 overlay, settings from `settings.ini`). The
+recompiler is the same pure-Python pipeline.
+
+1. Install dependencies: `bash xboxrecomp-main/tools/linux/install_deps.sh`
+   (a C/C++ toolchain, CMake, pkg-config, SDL2, libepoxy, OpenSSL, ffmpeg).
+2. Copy your own disc's files into `xboxrecomp-main/game_files/` as above.
+   The seeds in `orta/seeds/` are copied there automatically.
+3. From `orta/`, run `bash orta_loop.sh`. It translates the game if needed,
+   builds into `build64/`, and runs it.
+
+See [docs/LINUX_PORT_STATUS.md](docs/LINUX_PORT_STATUS.md) for what works and
+what does not yet (notably: FMV/WMA and some surface-format edge cases).
+
 ## Licence
 
 Code from xboxrecomp keeps its MIT licence (`xboxrecomp-main/LICENSE`). The

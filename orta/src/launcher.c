@@ -1,42 +1,50 @@
 /* launcher.c -- the settings window shown before the game starts.
  *
- * Shown the first time the game is started (settings.ini has no
- * [Launcher] ShowOnStart yet), every time if the player ticks "Show this
- * every time", and whenever Shift is held while the game starts. Scripted
- * runs (stderr captured, see recomp_diag_quiet) never see it.
+ * On Windows it is shown the first time the game is started (settings.ini has
+ * no [Launcher] ShowOnStart yet), every time if the player ticks "Show this
+ * every time", and whenever Shift is held while the game starts. Scripted runs
+ * (stderr captured, see recomp_diag_quiet) never see it.
  *
  * Plain Win32 so it is up before Direct3D: mouse, touch, keyboard, or a
  * controller (D-pad/stick moves, left/right changes, A selects, Start plays).
  * Values are written to settings.ini with WritePrivateProfileString, which
- * keeps the file's comments and the [Advanced] section as they are. */
+ * keeps the file's comments and the [Advanced] section as they are.
+ *
+ * On Linux the hand-rolled dialog is not rebuilt (it is a from-scratch Win32
+ * common-controls GUI). launcher_maybe_run() is a no-op: settings are driven
+ * from settings.ini, and the F1 overlay is the long-term settings surface on
+ * both platforms. See LINUX_PORT_SCOPE.md, Phase 1. The resolution helpers
+ * below are shared: the overlay and main.c use them on both platforms. */
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>
-#include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "launcher.h"
 
-extern int recomp_diag_quiet(void);
-
-enum {
-    ID_RES = 100, ID_MODE, ID_WINH, ID_WIDE, ID_VSYNC, ID_VOL, ID_VOLTXT,
-    ID_SHOW, ID_PLAY, ID_QUIT, ID_TIMER = 1
-};
+#ifdef _WIN32
+#include <windows.h>
+#include <commctrl.h>
+#else
+#include "platform/xbox_winnt.h"   /* _strnicmp, the Win32 type vocabulary */
+#include <SDL.h>
+#endif
 
 static const int k_res_h[] = { 480, 720, 1080, 1440, 2160, 0 };   /* 0: Native */
 static const char *k_res_v[] = { "480", "720", "1080", "1440", "2160", "Native" };
 static const char *k_res_n[] = { "original, fastest", "720p", "1080p", "1440p", "4K", "Native" };
-static const int k_winh[] = { 540, 720, 900, 1080, 1440 };
+
+/* ── Shared resolution helpers ───────────────────────────────────────── */
 
 /* The primary screen in real pixels. Asked once: the F1 menu labels ask
- * every frame, and EnumDisplaySettings is slow. */
+ * every frame, and the query is slow. */
 void orta_screen_size(int *w, int *h)
 {
     static int sw, sh;
     if (!sh) {
+#ifdef _WIN32
         DEVMODEW dm;
         memset(&dm, 0, sizeof dm);
         dm.dmSize = sizeof dm;
@@ -47,6 +55,18 @@ void orta_screen_size(int *w, int *h)
             sw = GetSystemMetrics(SM_CXSCREEN);
             sh = GetSystemMetrics(SM_CYSCREEN);
         }
+#else
+        SDL_DisplayMode dm;
+        if (!SDL_WasInit(SDL_INIT_VIDEO))
+            SDL_InitSubSystem(SDL_INIT_VIDEO);
+        if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.h) {
+            sw = dm.w;
+            sh = dm.h;
+        } else {
+            sw = 1920;
+            sh = 1080;
+        }
+#endif
     }
     *w = sw;
     *h = sh;
@@ -102,6 +122,27 @@ void orta_res_label(int i, int wide, char *out, int cap)
     w = wide ? (h * 16 + 8) / 9 : h * 4 / 3;
     snprintf(out, cap, "%d x %d (%s)", w, h, k_res_n[i]);
 }
+
+#ifndef _WIN32
+
+/* No native settings dialog on Linux; the F1 overlay is the settings surface
+ * and settings.ini is edited directly. Always "go straight to the game". */
+int launcher_maybe_run(const char *ini_path)
+{
+    (void)ini_path;
+    return 1;
+}
+
+#else /* _WIN32: the Win32 pre-game dialog */
+
+extern int recomp_diag_quiet(void);
+
+enum {
+    ID_RES = 100, ID_MODE, ID_WINH, ID_WIDE, ID_VSYNC, ID_VOL, ID_VOLTXT,
+    ID_SHOW, ID_PLAY, ID_QUIT, ID_TIMER = 1
+};
+
+static const int k_winh[] = { 540, 720, 900, 1080, 1440 };
 
 static const char *s_ini;
 static HWND s_wnd, s_res, s_mode, s_winh, s_wide, s_vsync, s_vol, s_voltxt, s_show;
@@ -495,3 +536,5 @@ int launcher_maybe_run(const char *ini_path)
     }
     return s_result;
 }
+
+#endif /* _WIN32 */

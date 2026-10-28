@@ -1082,56 +1082,6 @@ static ID3DBlob *compile(PfnCompile fn, const char *entry, const char *target)
     return compile_src(fn, s_hlsl, sizeof s_hlsl - 1, entry, target);
 }
 
-/* ── Prewarm: fill the shader cache without starting the game ──────────
- * Compiling the start-up shaders takes minutes on the first run (the game
- * waits on it before its first frame), so Setup runs the exe once with
- * --prewarm and this compiles them all into the disk cache, in parallel. */
-typedef struct { const char *src; size_t len; const char *entry, *target; } PrewarmJob;
-static PfnCompile s_prewarm_comp;
-
-static DWORD WINAPI prewarm_one(LPVOID arg)
-{
-    const PrewarmJob *j = (const PrewarmJob *)arg;
-    ID3DBlob *b = compile_src(s_prewarm_comp, j->src, j->len, j->entry, j->target);
-    REL(b);
-    return 0;
-}
-
-int nv2a_gpu_prewarm_shaders(void)
-{
-    static const PrewarmJob jobs[] = {
-        { s_hlsl,      sizeof s_hlsl - 1,      "vs_main",    "vs_5_0" },
-        { s_hlsl,      sizeof s_hlsl - 1,      "ps_main",    "ps_5_0" },
-        { s_hlsl,      sizeof s_hlsl - 1,      "ps_zoff",    "ps_5_0" },
-        { s_hlsl_vsh,  sizeof s_hlsl_vsh - 1,  "vs_prog",    "vs_5_0" },
-        { s_hlsl_vsh,  sizeof s_hlsl_vsh - 1,  "gs_pt",      "gs_5_0" },
-        { s_hlsl_vsh,  sizeof s_hlsl_vsh - 1,  "gs_ln",      "gs_5_0" },
-        { s_hlsl_blit, sizeof s_hlsl_blit - 1, "vs_blit",    "vs_5_0" },
-        { s_hlsl_blit, sizeof s_hlsl_blit - 1, "ps_down",    "ps_5_0" },
-        { s_hlsl_blit, sizeof s_hlsl_blit - 1, "ps_up",      "ps_5_0" },
-        { s_hlsl_blit, sizeof s_hlsl_blit - 1, "ps_present", "ps_5_0" },
-        { s_hlsl_blit, sizeof s_hlsl_blit - 1, "ps_overlay", "ps_5_0" },
-    };
-    enum { N = sizeof jobs / sizeof jobs[0] };
-    HANDLE th[N];
-    HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
-    int i, n = 0;
-    if (!dc) return 0;
-    s_prewarm_comp = (PfnCompile)(void *)GetProcAddress(dc, "D3DCompile");
-    s_create_blob = (PfnCreateBlob)(void *)GetProcAddress(dc, "D3DCreateBlob");
-    if (!s_prewarm_comp || !cache_ready()) return 0;
-    for (i = 0; i < N; i++) {
-        th[n] = CreateThread(NULL, 0, prewarm_one, (LPVOID)&jobs[i], 0, NULL);
-        if (th[n]) n++;
-        else prewarm_one((LPVOID)&jobs[i]);
-    }
-    for (i = 0; i < n; i++) {
-        WaitForSingleObject(th[i], INFINITE);
-        CloseHandle(th[i]);
-    }
-    return 1;
-}
-
 static int vsh_init(PfnCompile comp)
 {
     ID3DBlob *b = compile_src(comp, s_hlsl_vsh, sizeof s_hlsl_vsh - 1, "vs_prog", "vs_5_0");
@@ -3577,27 +3527,11 @@ uint32_t nv2a_gpu_zpass_collect(void)
     return n;
 }
 
-#else  /* !_WIN32: no D3D11, the software rasteriser is all there is. */
+#else  /* !_WIN32: the OpenGL back end lives in nv2a_gpu_gl.c. */
 
-int  nv2a_gpu_enabled(void) { return 0; }
-void nv2a_gpu_begin(const Nv2aGpuState *st) { (void)st; }
-void nv2a_gpu_tri(const Nv2aGpuVert *a, const Nv2aGpuVert *b, const Nv2aGpuVert *c)
-{ (void)a; (void)b; (void)c; }
-void nv2a_gpu_clear(const Nv2aGpuState *st, int color, uint32_t argb, int depth,
-                    uint32_t z) { (void)st; (void)color; (void)argb; (void)depth; (void)z; }
-void nv2a_gpu_flip(uint32_t present_base) { (void)present_base; }
-void nv2a_gpu_sync_range(uint32_t base, uint32_t bytes) { (void)base; (void)bytes; }
-void nv2a_gpu_sync_all(void) {}
-void nv2a_gpu_forget_range(uint32_t base, uint32_t bytes) { (void)base; (void)bytes; }
-void nv2a_gpu_zpass_enable(uint32_t on) { (void)on; }
-uint32_t nv2a_gpu_zpass_collect(void) { return 0; }
-int  nv2a_gpu_vsh_enabled(void) { return 0; }
-float *nv2a_gpu_vtx_begin(uint32_t nmax) { (void)nmax; return NULL; }
-void nv2a_gpu_hitch_counters(double *t, uint32_t *u) { *t = 0; *u = 0; }
-void nv2a_gpu_vtx_cancel(void) {}
-void nv2a_gpu_draw_program(const Nv2aGpuState *st, const float *in, uint32_t nverts,
-                           const uint32_t *idx, uint32_t nidx, const uint32_t *prog,
-                           uint32_t start, const float *consts)
-{ (void)st; (void)in; (void)nverts; (void)idx; (void)nidx; (void)prog; (void)start; (void)consts; }
+/* Defined in the D3D11 branch; referenced by the push-buffer executor
+ * (nv2a_pb_exec.c), which is built on both platforms. The nv2a_gpu_* entry
+ * points are provided by nv2a_gpu_gl.c on POSIX. */
+volatile long g_water_mode = 0;
 
 #endif

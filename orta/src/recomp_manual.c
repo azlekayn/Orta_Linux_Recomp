@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
@@ -153,24 +154,7 @@ static int orta_has_focus(void)
     GetWindowThreadProcessId(w, &pid);
     return pid == GetCurrentProcessId();
 }
-#endif
 
-#include <stdlib.h>
-#include <string.h>
-#include "overlay.h"
-
-/* ── Rumble ──────────────────────────────────────────────────────────────
- * XInputSetState's XINPUT_FEEDBACK is a 66-byte header (dwStatus, hEvent,
- * 58 reserved bytes) and then XINPUT_RUMBLE: left (heavy) and right (light)
- * motor speeds, 0..65535 -- the same pair Windows takes. The game's last
- * request is kept and sent on, scaled by settings.ini Rumble /
- * RumbleStrength (or the menu), and held at zero while the window is in
- * the background or the menu is open. */
-volatile float g_rumble_scale = -1.0f;      /* -1: from settings.ini */
-static uint16_t s_rum_want[2];              /* what the game asked for */
-static int      s_rum_sent[2] = { -1, -1 }; /* what the pad was last told */
-
-#ifdef _WIN32
 typedef struct { uint16_t l, r; } WinVib;
 typedef unsigned long (__stdcall *WinXInputSetState)(unsigned long, WinVib *);
 
@@ -190,7 +174,62 @@ static WinXInputSetState orta_win_xinput_set(void)
     }
     return fn;
 }
+
+#else /* POSIX: SDL2 GameController + SDL keyboard */
+
+#include <SDL.h>
+
+static SDL_GameController *s_pad;
+static int s_pad_tried;
+
+/* Open the first attached controller. SDL's video subsystem is already up
+ * (the GL backend owns the window); this only needs the controller one. */
+static void orta_open_pad(void)
+{
+    int i;
+    if (s_pad_tried)
+        return;
+    s_pad_tried = 1;
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    for (i = 0; i < SDL_NumJoysticks(); i++) {
+        if (!SDL_IsGameController(i))
+            continue;
+        s_pad = SDL_GameControllerOpen(i);
+        if (s_pad)
+            break;
+    }
+    fprintf(stderr, "[PAD] SDL controller %s\n",
+            s_pad ? "open" : "not found (keyboard only)");
+}
+
+/* Whether the game's window has the keyboard focus. SDL_GetKeyboardFocus is
+ * the SDL equivalent of GetForegroundWindow: it names the window that would
+ * receive a key. If video is not up yet, assume focused so input is not
+ * silently dropped during start-up. */
+static int orta_has_focus(void)
+{
+    if (!SDL_WasInit(SDL_INIT_VIDEO))
+        return 1;
+    return SDL_GetKeyboardFocus() != NULL;
+}
+
 #endif
+
+#include <stdlib.h>
+#include <string.h>
+#include "overlay.h"
+
+/* ── Rumble ──────────────────────────────────────────────────────────────
+ * XInputSetState's XINPUT_FEEDBACK is a 66-byte header (dwStatus, hEvent,
+ * 58 reserved bytes) and then XINPUT_RUMBLE: left (heavy) and right (light)
+ * motor speeds, 0..65535 -- the same pair Windows takes. The game's last
+ * request is kept and sent on, scaled by settings.ini Rumble /
+ * RumbleStrength (or the menu), and held at zero while the window is in
+ * the background or the menu is open. */
+volatile float g_rumble_scale = -1.0f;      /* -1: from settings.ini */
+static uint16_t s_rum_want[2];              /* what the game asked for */
+static int      s_rum_sent[2] = { -1, -1 }; /* what the pad was last told */
 
 static float orta_rumble_k(void)
 {
@@ -220,7 +259,13 @@ static void orta_rumble_send(int l, int r)
         s_rum_sent[1] = r;
     }
 #else
-    (void)l; (void)r;
+    if (s_pad && (l != s_rum_sent[0] || r != s_rum_sent[1])) {
+        /* SDL wants a duration; the game re-sends every frame while it is
+         * rumbling, so a short one that is refreshed is enough. */
+        SDL_GameControllerRumble(s_pad, (uint16_t)l, (uint16_t)r, 100);
+        s_rum_sent[0] = l;
+        s_rum_sent[1] = r;
+    }
 #endif
 }
 
@@ -236,9 +281,7 @@ static void orta_rumble_update(void)
     static int hooked;
     float k = orta_rumble_k();
     int quiet = ovl_is_open();
-#ifdef _WIN32
     quiet = quiet || !orta_has_focus();
-#endif
     if (!hooked) {
         hooked = 1;
         atexit(orta_rumble_exit);
@@ -302,6 +345,50 @@ static void orta_read_pad(uint32_t g)
         if (KEY('Q')) an[6] = 0xFF;
         if (KEY('W')) an[7] = 0xFF;
         #undef KEY
+    }
+#else
+    orta_open_pad();
+    if (s_pad && SDL_GameControllerGetAttached(s_pad)) {
+        SDL_GameControllerUpdate();
+        if (SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_DPAD_UP))    buttons |= 0x01;
+        if (SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  buttons |= 0x02;
+        if (SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  buttons |= 0x04;
+        if (SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) buttons |= 0x08;
+        if (SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_START))      buttons |= 0x10;
+        if (SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_BACK))       buttons |= 0x20;
+        an[0] = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_A) ? 0xFF : 0;
+        an[1] = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_B) ? 0xFF : 0;
+        an[2] = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_X) ? 0xFF : 0;
+        an[3] = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_Y) ? 0xFF : 0;
+        /* Xbox Black = right shoulder, White = left shoulder (same as the
+         * Windows XInput mapping above). */
+        an[4] = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? 0xFF : 0;
+        an[5] = SDL_GameControllerGetButton(s_pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 0xFF : 0;
+        an[6] = (uint8_t)(SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
+        an[7] = (uint8_t)(SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
+        lx = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_LEFTX);
+        /* SDL Y points down; the Xbox (and XInput) Y points up -- invert.
+         * (-1 - v) so v = -32768 does not overflow int16_t. */
+        ly = (int16_t)(-1 - SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_LEFTY));
+        rx = SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_RIGHTX);
+        ry = (int16_t)(-1 - SDL_GameControllerGetAxis(s_pad, SDL_CONTROLLER_AXIS_RIGHTY));
+    }
+    if (orta_has_focus()) {
+        const Uint8 *k = SDL_GetKeyboardState(NULL);
+        if (k[SDL_SCANCODE_UP])    buttons |= 0x01;
+        if (k[SDL_SCANCODE_DOWN])  buttons |= 0x02;
+        if (k[SDL_SCANCODE_LEFT])  buttons |= 0x04;
+        if (k[SDL_SCANCODE_RIGHT]) buttons |= 0x08;
+        if (k[SDL_SCANCODE_RETURN]) buttons |= 0x10;                       /* Start */
+        if (k[SDL_SCANCODE_ESCAPE] || k[SDL_SCANCODE_BACKSPACE]) buttons |= 0x20; /* Back */
+        if (k[SDL_SCANCODE_Z]) an[0] = 0xFF;
+        if (k[SDL_SCANCODE_X]) an[1] = 0xFF;
+        if (k[SDL_SCANCODE_A]) an[2] = 0xFF;
+        if (k[SDL_SCANCODE_S]) an[3] = 0xFF;
+        if (k[SDL_SCANCODE_V]) an[4] = 0xFF;   /* Black */
+        if (k[SDL_SCANCODE_C]) an[5] = 0xFF;   /* White */
+        if (k[SDL_SCANCODE_Q]) an[6] = 0xFF;
+        if (k[SDL_SCANCODE_W]) an[7] = 0xFF;
     }
 #endif
     {   /* The settings menu takes the controls while it is up, and until
@@ -943,6 +1030,22 @@ void recomp_unimpl(const char *text, uint32_t va)
     static int printed;
     const char *trap = getenv("RECOMP_UNIMPL_TRAP");
     int stop = trap && *trap && *trap != '0';
+
+    /* x86 port I/O. The lifter has no translation, but a driver's polling loop
+     * (Orta's vblank wait reads port 0x80C0 and spins) needs the destination
+     * register updated or it never terminates. Emulate the byte read with a
+     * value the title can act on; RECOMP_PORT_IN overrides it for probing. */
+    if (text && strncmp(text, "in al, dx", 9) == 0) {
+        const char *p = getenv("RECOMP_PORT_IN");
+        uint32_t v = p ? (uint32_t)strtoul(p, NULL, 0) : 0u;
+        g_eax = (g_eax & 0xFFFFFF00u) | (v & 0xFFu);
+        if (printed < 3) {
+            printed++;
+            fprintf(stderr, "[UNIMPL] `in al, dx` -> AL=0x%02X (RECOMP_PORT_IN to change)\n",
+                    (unsigned)(v & 0xFFu));
+        }
+        return;
+    }
 
     if (printed < 50 || stop) {
         printed++;

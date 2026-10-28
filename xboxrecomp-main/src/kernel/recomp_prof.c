@@ -681,4 +681,12 @@ void recomp_prof_start(void)
 #else
 void recomp_prof_start(void) {}
 void recomp_watch_dump(void) {}
+
+/* The profiler is Windows-only, but the kernel bridge and memory layout
+ * reference these globals on both platforms (the wait dump is a bridge
+ * callback; the nv2a exec thread id is read by the ack thread). Define them
+ * here so the POSIX link resolves. */
+#include "platform/xbox_winnt.h"
+void (*g_recomp_dump_waits)(void) = 0;
+volatile DWORD g_nv2a_exec_tid = 0;
 #endif

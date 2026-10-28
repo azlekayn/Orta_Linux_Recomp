@@ -1,13 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ============================================================================
-# YOUR_GAME_NAME - Static Recompilation
+# Panzer Dragoon Orta - Static Recompilation
 #
-# Copy this template to your game project root and customize:
-#   1. Change the project name below
-#   2. Set XBOXRECOMP_DIR to where you cloned xboxrecomp
-#   3. Adjust source file lists as you add game-specific code
-#   4. Add any game-specific compile definitions or link libraries
+# Windows host: WIN32 subsystem executable, D3D11 backend (from the
+#   xboxrecomp runtime), a D3D11 ImGui overlay, and the Win32 settings dialog.
+# POSIX host:   native main(), the OpenGL 3.3/SDL2 backend the runtime selects
+#   on a non-Windows configure, an OpenGL ImGui overlay, and no native settings
+#   dialog (settings.ini + the F1 overlay stand in for it).
+#
+# The runtime itself (../xboxrecomp-main) auto-selects its POSIX/SDL2/GL
+# branches under add_subdirectory() below; nothing there needs changing here.
+# See LINUX_PORT_SCOPE.md.
 # ============================================================================
 
 project(orta_recomp C CXX)
@@ -54,11 +58,13 @@ set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
     src/launcher.c
-    src/orta.rc          # application icon (src/orta.ico)
-    # Add game-specific sources here, e.g.:
-    # src/asset_loader.c
-    # src/custom_renderer.c
 )
+
+# The application icon (and its resource document) is a Windows binary
+# resource; there is nothing on Linux that reads a .rc.
+if(WIN32)
+    list(APPEND GAME_SOURCES src/orta.rc)
+endif()
 
 # The recomp pipeline also generates a dispatch header and function declarations.
 # These are included by the generated .c files:
@@ -66,10 +72,17 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
-add_executable(${PROJECT_NAME} WIN32
-    ${GAME_SOURCES}
-    ${RECOMP_GEN_SOURCES}
-)
+if(WIN32)
+    add_executable(${PROJECT_NAME} WIN32
+        ${GAME_SOURCES}
+        ${RECOMP_GEN_SOURCES}
+    )
+else()
+    add_executable(${PROJECT_NAME}
+        ${GAME_SOURCES}
+        ${RECOMP_GEN_SOURCES}
+    )
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
@@ -81,18 +94,26 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-# Windows SDK libraries needed at link time
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11
-    dxgi
-    dxguid
-    xinput
-    comctl32
-    winmm
-    # Lets the fault handler resolve the host RIP back to the generated
-    # function's symbol, i.e. to the guest function that faulted.
-    dbghelp
-)
+if(WIN32)
+    # Windows SDK libraries needed at link time
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        d3d11
+        dxgi
+        dxguid
+        xinput
+        comctl32
+        winmm
+        # Lets the fault handler resolve the host RIP back to the generated
+        # function's symbol, i.e. to the guest function that faulted.
+        dbghelp
+    )
+else()
+    # dladdr/backtrace for the POSIX crash handler in main.c. _GNU_SOURCE must
+    # be defined by the compiler (not in a source) because the forced include
+    # of recomp_extra.h pulls in <stdint.h> before any source-level #define.
+    target_compile_definitions(${PROJECT_NAME} PRIVATE _GNU_SOURCE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)
@@ -102,41 +123,54 @@ if(MSVC)
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+    # dr0..dr7/cr0..cr4 scratch registers, forced into every recompiled TU.
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        "/FI${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/recomp_extra.h")
+else()
+    # GCC/Clang forced include of the same scratch registers.
+    #   -include must be separate from its argument.
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/recomp_extra.h)
 endif()
 
-# ── Game-specific additions ─────────────────────────────────────
-#
-# Add any game-specific libraries, loaders, or custom renderers below.
-# Examples:
-#
-# # Custom texture loader for your game's format
-# target_sources(${PROJECT_NAME} PRIVATE src/texture_loader.c)
-#
-# # If your game uses RenderWare, you may need a RW bridge layer
-# target_sources(${PROJECT_NAME} PRIVATE src/rw_bridge.c)
-#
-# # Additional compile definitions for debugging
-# target_compile_definitions(${PROJECT_NAME} PRIVATE
-#     ENABLE_ICALL_TRACE=1
-#     VERBOSE_KERNEL_LOG=1
-# )
-target_compile_options(${PROJECT_NAME} PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/recomp_extra.h")
-
-# ── Settings menu (F1): Dear ImGui over the D3D11 swap chain ─────
+# ── Settings menu (F1): Dear ImGui over the presented frame ──────
 # Its own library, so the recompiled code's forced include and options
 # stay off the C++.
-add_library(orta_overlay STATIC
-    src/overlay.cpp
+set(ORTA_IMGUI_SOURCES
     third_party/imgui/imgui.cpp
     third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp
     third_party/imgui/imgui_widgets.cpp
-    third_party/imgui/imgui_impl_dx11.cpp
 )
-set_target_properties(orta_overlay PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-target_include_directories(orta_overlay PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
-)
-target_link_libraries(orta_overlay PRIVATE d3d11 xinput)
+
+if(WIN32)
+    add_library(orta_overlay STATIC
+        src/overlay.cpp
+        ${ORTA_IMGUI_SOURCES}
+        third_party/imgui/imgui_impl_dx11.cpp
+    )
+    set_target_properties(orta_overlay PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(orta_overlay PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+    )
+    target_link_libraries(orta_overlay PRIVATE d3d11 xinput)
+else()
+    add_library(orta_overlay STATIC
+        src/overlay_gl.cpp
+        ${ORTA_IMGUI_SOURCES}
+        third_party/imgui/imgui_impl_opengl3.cpp
+    )
+    set_target_properties(orta_overlay PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    find_package(SDL2 REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(EPOXY REQUIRED epoxy)
+    target_include_directories(orta_overlay PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+    )
+    target_include_directories(orta_overlay PRIVATE ${EPOXY_INCLUDE_DIRS})
+    target_link_libraries(orta_overlay PRIVATE SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE orta_overlay)

@@ -859,6 +859,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
+        /* A create into a cache subdirectory whose parent does not exist yet:
+         * POSIX open() will not make it (nor would Win32 CreateFileW), so do
+         * it here or the copy fails and the title spins retrying. */
+        if (CreateDisposition != XBOX_FILE_OPEN)
+            xbox_path_make_parent(host_path);
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
     }
 

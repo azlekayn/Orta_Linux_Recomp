@@ -101,6 +101,9 @@ extern "C" {
 #ifndef WINAPI
 #define WINAPI
 #endif
+#ifndef NTAPI
+#define NTAPI
+#endif
 #ifndef APIENTRY
 #define APIENTRY
 #endif
@@ -153,35 +156,23 @@ typedef void             **PHANDLE, **LPHANDLE;
 typedef void              *HMODULE, *HINSTANCE, *HKEY, *HLOCAL, *HGLOBAL;
 typedef void              *HWND, *HDC, *HBITMAP, *HICON, *HMENU, *HCURSOR;
 
-/* PCONTEXT: Windows VEH register state. On Linux the equivalent is
- * ucontext_t*; we leave it opaque here since Linux callers don't use it. */
- 
-#ifdef __linux__
-/* On gcc these data structures are necessary  even if anyone is going to be used*/
-typedef union Register{
-	uint32_t X; // all register
-	uint8_t SR[4]; // Subregister
-} REG; 
-
-typedef uint32_t  IREG;
-
-typedef struct ProcessorCONTEXT{
-	// General
-	REG EAX;
-	REG EBX;
-	REG ECX;
-	REG EDX;
-	IREG ESI;
-	IREG EDI;
-	IREG ESP;
-	IREG EBP;
-	//  Instruction Pointer Flags
-	IREG EIP;
-	IREG EFlags;
-} *PCONTEXT;
-#else
-typedef void              *PCONTEXT;
-#endif
+/* PCONTEXT: register state handed to a fault handler.
+ *
+ * Windows supplies the real CONTEXT from <windows.h>. On POSIX there is no
+ * such type, so one is defined here with the *same* field names the x86-64
+ * MMIO decoders already use (Rax..R15, Rip, EFlags). That lets src/apu and
+ * src/nv2a decode a POSIX fault through one unmodified code path: the
+ * sigaction dispatcher in win32_compat.c fills this struct from a ucontext_t
+ * and writes the decoder's changes back. 64-bit fields, because the
+ * recompiled code runs as native x86-64. */
+typedef struct _XBOX_CONTEXT {
+    uint64_t Rax, Rcx, Rdx, Rbx;
+    uint64_t Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+    uint32_t _pad;
+} XBOX_CONTEXT, *PCONTEXT;
 /* Xbox/UTF-16 wide char is 16-bit, unlike the 32-bit Linux wchar_t. */
 typedef uint16_t           WCHAR, *PWCHAR, *LPWSTR, *PWSTR;
 typedef const uint16_t    *LPCWSTR, *PCWSTR;

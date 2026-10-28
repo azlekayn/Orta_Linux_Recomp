@@ -53,6 +53,26 @@ void xbox_D3D8SetWindowTitle(const char *title)
 {
     g_window_title = (title && title[0]) ? title : "Xbox Game";
 }
+
+/* ---- Overlay / host-input hooks -----------------------------------------
+ *
+ * The Windows runtime routes its F1 overlay through nv2a_gpu.c's present path
+ * (g_present_overlay_hook / g_present_pause_hook) and fb_present.c's window
+ * (g_wndproc_hook). The GL backend owns its own SDL window and swap loop and
+ * never goes through either, so the same-shaped globals live here and are
+ * driven from dev_Present(). orta/overlay_gl.cpp registers through them.
+ *
+ * g_sdlevent_hook delivers each raw SDL event to the overlay, replacing the
+ * WM_ message translation the Windows overlay gets from its window procedure.
+ */
+void (*g_present_overlay_hook)(void *dev, void *ctx, void *rtv, unsigned w, unsigned h);
+int  (*g_present_pause_hook)(void);
+void (*g_sdlevent_hook)(const SDL_Event *ev);
+
+/* Live settings the Windows present path also honours. -1 means "from
+ * settings.ini / the overlay". */
+volatile long  g_present_vsync = -1;
+volatile float g_present_crop[2] = { -1.0f, -1.0f };
 #define MAX_TSS   33
 #define MAX_TSU   8     /* texture stages */
 
@@ -69,6 +89,12 @@ typedef struct {
     D3DMATRIX        m_world, m_view, m_proj;
     D3DVIEWPORT8     viewport;
     D3DCOLOR         tex_factor;
+
+    /* Current render target (an IDirect3DSurface8* or NULL for the default
+     * framebuffer) and the size SetViewport/readback flip against. D3D8's
+     * viewport origin is top-left; the flip needs the target's height. */
+    void            *cur_rt, *cur_zs;
+    int              target_w, target_h;
 
     /* Current bindings */
     IDirect3DBaseTexture8 *textures[MAX_TSU];
@@ -93,6 +119,14 @@ typedef struct {
     GLsizeiptr       stream_vbo_size;
     GLsizeiptr       stream_ibo_size;
 
+    /* The game renders into this offscreen target at its own resolution;
+     * dev_Present scales it to the window (and the F1 overlay draws on top
+     * of the window afterwards). */
+    GLuint           scene_fbo;
+    GLuint           scene_tex;
+    GLuint           scene_depth;
+    int              widescreen;
+
     /* GL fixed shader program */
     GLuint           prog;
     GLint            u_mvp;
@@ -102,6 +136,13 @@ typedef struct {
 } D3DGL;
 
 static D3DGL g;
+
+/* The SDL window the GL context is bound to. The overlay uses it for
+ * fullscreen toggling, focus queries and native size. */
+SDL_Window *xbox_D3D8Window(void)
+{
+    return g.window;
+}
 
 /* ======================================================================== */
 /* Tiny helpers                                                             */
@@ -341,10 +382,46 @@ typedef struct {
 typedef struct {
     IDirect3DSurface8 iface;
     LONG     ref;
-    UINT     width, height;
+    UINT     width, height, level;
     D3DFORMAT format;
-    /* Surfaces are minimal stubs in the first cut. */
+
+    /* A surface either wraps a mip level of a texture (owner, borrowed) or
+     * owns its own GL texture (an offscreen render target / image surface).
+     * The back buffer owns nothing and reads the default framebuffer back. */
+    GLTexture *owner;        /* borrowed texture level, or NULL */
+    GLuint   gl_tex;         /* owned GL texture (RT / image / depth), or 0 */
+    GLuint   fbo;            /* owned framebuffer for a colour render target */
+    int      is_depth;       /* depth/stencil format */
+    int      is_backbuffer;  /* the device's back buffer */
+    BYTE    *sys_mem;        /* owned CPU pixels (RT / image / back buffer) */
+    UINT     pitch;
+    int      sys_dirty;      /* sys_mem changed since the last upload */
+    int      locked;
 } GLSurface;
+
+/* Row pitch for the formats the GL backend recognises; everything else is
+ * assumed 32-bit, matching CreateTexture's staging layout. */
+static UINT sf_pitch(D3DFORMAT fmt, UINT w)
+{
+    switch (fmt) {
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_A4R4G4B4:
+        return w * 2;
+    default:
+        return w * 4;
+    }
+}
+
+/* GL texture that holds the surface's pixels, if any. */
+static GLuint sf_gl_tex(const GLSurface *s)
+{
+    return s->owner ? s->owner->gl_tex : s->gl_tex;
+}
+
+/* Defined in the surface section, once g_sf_vtbl exists. */
+static IDirect3DSurface8 *gl_surface_new_from_texture(GLTexture *t, UINT level);
 
 /* ======================================================================== */
 /* IDirect3DVertexBuffer8                                                   */
@@ -458,7 +535,12 @@ static HRESULT __stdcall tex_GetLevelDesc(IDirect3DTexture8 *s, UINT lvl, D3DSUR
     return D3D_OK;
 }
 static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *s, UINT lvl, IDirect3DSurface8 **pp)
-{ (void)s;(void)lvl; if(pp) *pp=NULL; return D3D_OK; }
+{
+    GLTexture *t=(GLTexture*)s;
+    if (!pp || lvl >= t->levels) return D3DERR_INVALIDCALL;
+    *pp = gl_surface_new_from_texture(t, lvl);
+    return *pp ? D3D_OK : D3DERR_INVALIDCALL;
+}
 static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT lvl, D3DLOCKED_RECT *pLR,
                                        const RECT *r, DWORD flags)
 {
@@ -491,7 +573,13 @@ static const IDirect3DTexture8Vtbl g_tex_vtbl = {
 };
 
 /* ======================================================================== */
-/* IDirect3DSurface8 (minimal stub)                                         */
+/* IDirect3DSurface8                                                        */
+/*                                                                          */
+/* Surfaces back LockRect for the three things a title locks: a texture mip  */
+/* level (palette / procedural write-back), an offscreen render target, and  */
+/* the back buffer (screenshots). A level surface borrows its texture's      */
+/* staging memory; an owned surface has its own GL texture and a CPU copy    */
+/* that LockRect reads back from the GPU into and UnlockRect uploads.        */
 /* ======================================================================== */
 
 static HRESULT __stdcall sf_QueryInterface(IDirect3DSurface8 *s, const IID *iid, void **pp)
@@ -502,7 +590,19 @@ static ULONG __stdcall sf_Release(IDirect3DSurface8 *s)
 {
     GLSurface *t=(GLSurface*)s;
     LONG r=__atomic_sub_fetch(&t->ref,1,__ATOMIC_SEQ_CST);
-    if (r<=0) free(t);
+    if (r<=0) {
+        if (t->owner) {
+            /* Borrowed level: drop the reference we added to the texture. */
+            __atomic_sub_fetch(&t->owner->ref, 1, __ATOMIC_SEQ_CST);
+        }
+        if (!t->owner && !t->is_backbuffer) {
+            /* The back buffer's GL resources belong to the device. */
+            if (t->gl_tex) glDeleteTextures(1, &t->gl_tex);
+            if (t->fbo)    glDeleteFramebuffers(1, &t->fbo);
+            free(t->sys_mem);
+        }
+        free(t);
+    }
     return (ULONG)r;
 }
 static HRESULT __stdcall sf_GetDevice(IDirect3DSurface8 *s, IDirect3DDevice8 **pp)
@@ -515,20 +615,193 @@ static HRESULT __stdcall sf_GetDesc(IDirect3DSurface8 *s, D3DSURFACE_DESC *pD)
     pD->Format=t->format; pD->Width=t->width; pD->Height=t->height;
     return D3D_OK;
 }
-static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *s, D3DLOCKED_RECT *pL, const RECT *r, DWORD f)
-{ (void)s;(void)pL;(void)r;(void)f; return D3DERR_INVALIDCALL; }
-static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *s) { (void)s; return D3D_OK; }
+
+/* Pull the surface's GPU pixels into its CPU copy. Called lazily by
+ * LockRect so a surface can be read on the game thread, where the GL context
+ * is current, without every UnlockRect paying for a readback. */
+static void sf_readback(GLSurface *sf)
+{
+    GLuint tex = sf_gl_tex(sf);
+    if (!tex)
+        return;
+    if (!sf->sys_mem) {
+        sf->pitch = sf_pitch(sf->format, sf->width);
+        sf->sys_mem = (BYTE *)calloc(1, (size_t)sf->pitch * sf->height);
+    }
+    if (!sf->sys_mem)
+        return;
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    if (sf->is_backbuffer) {
+        /* The back buffer is the offscreen scene FBO the game renders into. */
+        glBindFramebuffer(GL_FRAMEBUFFER, sf->fbo ? sf->fbo : 0);
+        glReadPixels(0, 0, (GLsizei)sf->width, (GLsizei)sf->height,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, sf->sys_mem);
+    } else if (sf->fbo) {
+        /* An offscreen render target exposes its contents through the same
+         * framebuffer it was rendered into. */
+        GLint prev = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
+        glBindFramebuffer(GL_FRAMEBUFFER, sf->fbo);
+        glReadPixels(0, 0, (GLsizei)sf->width, (GLsizei)sf->height,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, sf->sys_mem);
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev);
+    } else {
+        /* An image surface: its contents live in gl_tex. */
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_BGRA,
+                      GL_UNSIGNED_INT_8_8_8_8_REV, sf->sys_mem);
+    }
+}
+
+static HRESULT __stdcall sf_LockRect(IDirect3DSurface8 *s, D3DLOCKED_RECT *pL,
+                                     const RECT *r, DWORD f)
+{
+    GLSurface *sf=(GLSurface*)s;
+    (void)r; (void)f;
+    if (!pL) return D3DERR_INVALIDCALL;
+    if (sf->locked) return D3DERR_INVALIDCALL;     /* D3D8 surfaces are not re-entrant */
+    sf->locked = 1;
+
+    if (sf->owner) {
+        /* A texture level: hand back the texture's staging memory. */
+        pL->Pitch = (INT)sf->owner->pitch;
+        pL->pBits = sf->owner->sys_mem;
+        sf->owner->dirty = TRUE;
+        return D3D_OK;
+    }
+
+    /* Owned colour surface: refresh the CPU copy from the GPU so a lock sees
+     * what is currently on screen / in the render target. Depth surfaces are
+     * not readable this way and keep plain staging memory. */
+    if (!sf->is_depth)
+        sf_readback(sf);
+
+    if (!sf->sys_mem) {
+        sf->pitch = sf_pitch(sf->format, sf->width);
+        sf->sys_mem = (BYTE *)calloc(1, (size_t)sf->pitch * sf->height);
+    }
+    if (!sf->sys_mem) { sf->locked = 0; return D3DERR_INVALIDCALL; }
+
+    pL->Pitch = (INT)sf->pitch;
+    pL->pBits = sf->sys_mem;
+    sf->sys_dirty = TRUE;
+    return D3D_OK;
+}
+
+static HRESULT __stdcall sf_UnlockRect(IDirect3DSurface8 *s)
+{
+    GLSurface *sf=(GLSurface*)s;
+    sf->locked = 0;
+
+    if (sf->owner) {
+        /* Upload through the owning texture (level 0 staging, as the texture
+         * LockRect path does). */
+        if (sf->owner->dirty && sf->owner->gl_tex)
+            tex_UnlockRect((IDirect3DTexture8 *)&sf->owner->iface, 0);
+        return D3D_OK;
+    }
+    /* Owned colour surface: upload the CPU copy if LockRect handed it out. */
+    if (sf->gl_tex && !sf->is_depth && sf->sys_dirty) {
+        glBindTexture(GL_TEXTURE_2D, sf->gl_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     sf->width, sf->height, 0,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, sf->sys_mem);
+        sf->sys_dirty = 0;
+    }
+    return D3D_OK;
+}
 
 static const IDirect3DSurface8Vtbl g_sf_vtbl = {
     sf_QueryInterface, sf_AddRef, sf_Release,
     sf_GetDevice, sf_GetDesc, sf_LockRect, sf_UnlockRect,
 };
 
+/* A level surface borrowing a texture. Used by IDirect3DTexture8::
+ * GetSurfaceLevel; the surface takes a reference on the texture. */
+static IDirect3DSurface8 *gl_surface_new_from_texture(GLTexture *t, UINT level)
+{
+    GLSurface *sf = (GLSurface *)calloc(1, sizeof(*sf));
+    if (!sf) return NULL;
+    sf->iface.lpVtbl = &g_sf_vtbl;
+    sf->ref   = 1;
+    sf->owner = t;
+    sf->level = level;
+    sf->width  = t->width  >> level; if (!sf->width)  sf->width  = 1;
+    sf->height = t->height >> level; if (!sf->height) sf->height = 1;
+    sf->format = t->format;
+    sf->pitch  = t->pitch;
+    __atomic_add_fetch(&t->ref, 1, __ATOMIC_SEQ_CST);
+    return &sf->iface;
+}
+
+/* An owned GL-texture surface: an offscreen render target (fbo != 0), a
+ * depth/stencil surface (is_depth), or a lockable image surface. */
+static GLSurface *gl_surface_new_owned(UINT w, UINT h, D3DFORMAT fmt,
+                                       int is_depth, int is_rt)
+{
+    GLSurface *sf = (GLSurface *)calloc(1, sizeof(*sf));
+    if (!sf) return NULL;
+    sf->iface.lpVtbl = &g_sf_vtbl;
+    sf->ref = 1;
+    sf->width = w; sf->height = h; sf->format = fmt;
+    sf->is_depth = is_depth;
+    sf->pitch = sf_pitch(fmt, w);
+    sf->sys_mem = (BYTE *)calloc(1, (size_t)sf->pitch * (h ? h : 1));
+    glGenTextures(1, &sf->gl_tex);
+    glBindTexture(GL_TEXTURE_2D, sf->gl_tex);
+    if (is_depth) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8,
+                     (GLsizei)w, (GLsizei)h, 0,
+                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+    } else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     (GLsizei)w, (GLsizei)h, 0,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (is_rt) {
+        glGenFramebuffers(1, &sf->fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, sf->fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, sf->gl_tex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    return sf;
+}
+
+
 /* ======================================================================== */
 /* IDirect3DDevice8                                                         */
 /* ======================================================================== */
 
 static IDirect3DDevice8 g_device;   /* singleton, vtable set at init */
+
+/* The device's back buffer, as a surface. It has no GL texture of its own:
+ * LockRect reads the default framebuffer back (screenshots). Created lazily
+ * because it needs the back-buffer size from CreateDevice. */
+static GLSurface *s_backbuffer;
+
+static IDirect3DSurface8 *gl_backbuffer(void)
+{
+    if (!s_backbuffer) {
+        s_backbuffer = (GLSurface *)calloc(1, sizeof(*s_backbuffer));
+        if (!s_backbuffer) return NULL;
+        s_backbuffer->iface.lpVtbl = &g_sf_vtbl;
+        s_backbuffer->ref = 1;
+        s_backbuffer->is_backbuffer = 1;
+        s_backbuffer->width  = (UINT)g.backbuf_w;
+        s_backbuffer->height = (UINT)g.backbuf_h;
+        s_backbuffer->format = D3DFMT_A8R8G8B8;
+        s_backbuffer->pitch  = (UINT)g.backbuf_w * 4;
+        s_backbuffer->fbo    = g.scene_fbo;   /* the offscreen scene target */
+    }
+    return &s_backbuffer->iface;
+}
 
 static HRESULT __stdcall dev_QueryInterface(IDirect3DDevice8 *s, const IID *iid, void **pp)
 { (void)s;(void)iid;(void)pp; return D3DERR_INVALIDCALL; }
@@ -544,25 +817,152 @@ static HRESULT __stdcall dev_GetCreationParameters(IDirect3DDevice8 *s, void *pP
 static HRESULT __stdcall dev_Reset(IDirect3DDevice8 *s, D3DPRESENT_PARAMETERS *pPP)
 { (void)s;(void)pPP; return D3D_OK; }
 
-static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
-                                     HWND hwnd, void *dirty)
+static void gl_pump_events(void)
 {
-    (void)s;(void)src;(void)dst;(void)hwnd;(void)dirty;
-    SDL_GL_SwapWindow(g.window);
-    /* Pump events so the window stays responsive. Quit closes the window
-     * but leaves the process running until the game's loop notices. */
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        if (g_sdlevent_hook)
+            g_sdlevent_hook(&ev);
         if (ev.type == SDL_QUIT) {
             fprintf(stderr, "[d3d8_gl] window close requested\n");
         }
     }
+}
+
+/* Native pixel size of the drawable, for the overlay's DisplaySize. */
+static void gl_drawable_size(int *w, int *h)
+{
+    *w = g.backbuf_w;
+    *h = g.backbuf_h;
+    if (g.window)
+        SDL_GL_GetDrawableSize(g.window, w, h);
+    if (*w <= 0) *w = 640;
+    if (*h <= 0) *h = 480;
+}
+
+/* Draw the offscreen scene texture to the window, scaled and centred, with
+ * black bars. Leaves the default framebuffer bound so the overlay can draw
+ * on top of it. */
+static void present_scene(void)
+{
+    int dw, dh, vx, vy, vw, vh;
+    float dst_ar;
+    struct { float x, y, z, u, v; } q[4];
+
+    gl_drawable_size(&dw, &dh);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(1, 1, 1, 1);
+    glDepthMask(GL_TRUE);
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    /* The picture keeps its shape (16:9 widescreen or the original 4:3),
+     * fitted and centred, as the Windows present path does. */
+    dst_ar = g.widescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+    vw = dw;
+    vh = (int)((float)dw / dst_ar + 0.5f);
+    if (vh > dh) { vh = dh; vw = (int)((float)dh * dst_ar + 0.5f); }
+    vx = (dw - vw) / 2;
+    vy = (dh - vh) / 2;
+    glViewport(vx, vy, vw, vh);
+
+    q[0].x = -1; q[0].y = -1; q[0].z = 0; q[0].u = 0; q[0].v = 0;
+    q[1].x =  1; q[1].y = -1; q[1].z = 0; q[1].u = 1; q[1].v = 0;
+    q[2].x = -1; q[2].y =  1; q[2].z = 0; q[2].u = 0; q[2].v = 1;
+    q[3].x =  1; q[3].y =  1; q[3].z = 0; q[3].u = 1; q[3].v = 1;
+
+    glUseProgram(g.prog);
+    glBindVertexArray(g.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g.stream_vbo);
+    if ((GLsizeiptr)sizeof q > g.stream_vbo_size) {
+        glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW);
+        g.stream_vbo_size = sizeof q;
+    } else {
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof q, q);
+    }
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof q[0], (const void *)0);
+    glDisableVertexAttribArray(1);
+    glVertexAttrib4f(1, 1, 1, 1, 1);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof q[0],
+                          (const void *)(3 * sizeof(float)));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g.scene_tex);
+    glUniform1i(g.u_tex0, 0);
+    glUniform1i(g.u_use_tex, 1);
+    glUniform1i(g.u_use_xform, 0);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
+/* Put the device back on the scene target after presenting, so a game frame
+ * that does not itself call SetRenderTarget still draws there. */
+static void restore_scene_target(void)
+{
+    int th = g.target_h ? g.target_h : g.backbuf_h;
+    glBindFramebuffer(GL_FRAMEBUFFER, g.scene_fbo);
+    if (g.viewport.Width && g.viewport.Height) {
+        glViewport((GLint)g.viewport.X,
+                   (GLint)(th - g.viewport.Y - g.viewport.Height),
+                   (GLsizei)g.viewport.Width, (GLsizei)g.viewport.Height);
+    } else {
+        glViewport(0, 0, g.backbuf_w, g.backbuf_h);
+    }
+}
+
+static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const RECT *dst,
+                                     HWND hwnd, void *dirty)
+{
+    (void)s;(void)src;(void)dst;(void)hwnd;(void)dirty;
+
+    /* F1 overlay: while it is open the game is held here, at its present, so
+     * it truly stops behind the menu instead of continuing to animate. The
+     * game thread is the only thread touching the GL context, so this loop
+     * is safe. */
+    if (g_present_pause_hook && g_present_pause_hook()) {
+        for (;;) {
+            int w, h;
+            gl_pump_events();
+            present_scene();
+            gl_drawable_size(&w, &h);
+            if (g_present_overlay_hook)
+                g_present_overlay_hook(g.window, NULL, NULL, (unsigned)w, (unsigned)h);
+            SDL_GL_SwapWindow(g.window);
+            if (!g_present_pause_hook())
+                break;
+            SDL_Delay(8);
+        }
+        restore_scene_target();
+        return D3D_OK;
+    }
+
+    gl_pump_events();
+    present_scene();
+    if (g_present_overlay_hook) {
+        int w, h;
+        gl_drawable_size(&w, &h);
+        g_present_overlay_hook(g.window, NULL, NULL, (unsigned)w, (unsigned)h);
+    }
+    if (g_present_vsync >= 0)
+        SDL_GL_SetSwapInterval((int)g_present_vsync);
+    SDL_GL_SwapWindow(g.window);
+    restore_scene_target();
     return D3D_OK;
 }
 
 static HRESULT __stdcall dev_GetBackBuffer(IDirect3DDevice8 *s, INT i, DWORD t,
                                             IDirect3DSurface8 **pp)
-{ (void)s;(void)i;(void)t; if(pp) *pp=NULL; return D3D_OK; }
+{
+    (void)s; (void)i; (void)t;
+    if (!pp) return D3DERR_INVALIDCALL;
+    *pp = gl_backbuffer();
+    return *pp ? D3D_OK : D3DERR_INVALIDCALL;
+}
 
 static HRESULT __stdcall dev_BeginScene(IDirect3DDevice8 *s) { (void)s; return D3D_OK; }
 static HRESULT __stdcall dev_EndScene(IDirect3DDevice8 *s)   { (void)s; return D3D_OK; }
@@ -854,31 +1254,106 @@ static HRESULT __stdcall dev_CreateIndexBuffer(IDirect3DDevice8 *s, UINT len, DW
 static HRESULT __stdcall dev_CreateRenderTarget(IDirect3DDevice8 *s, UINT w, UINT h,
         D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms, BOOL lockable, IDirect3DSurface8 **pp)
 {
+    GLSurface *t;
     (void)s; (void)ms; (void)lockable;
     if (!pp) return D3DERR_INVALIDCALL;
-    GLSurface *t = (GLSurface *)calloc(1, sizeof(*t));
-    t->iface.lpVtbl = &g_sf_vtbl;
-    t->ref = 1; t->width = w; t->height = h; t->format = fmt;
+    t = gl_surface_new_owned(w, h, fmt, 0, 1);
+    if (!t) return D3DERR_INVALIDCALL;
     *pp = &t->iface;
     return D3D_OK;
 }
 static HRESULT __stdcall dev_CreateDepthStencilSurface(IDirect3DDevice8 *s, UINT w, UINT h,
         D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms, IDirect3DSurface8 **pp)
-{ return dev_CreateRenderTarget(s, w, h, fmt, ms, FALSE, pp); }
+{
+    GLSurface *t;
+    (void)s; (void)ms;
+    if (!pp) return D3DERR_INVALIDCALL;
+    t = gl_surface_new_owned(w, h, fmt, 1, 0);
+    if (!t) return D3DERR_INVALIDCALL;
+    *pp = &t->iface;
+    return D3D_OK;
+}
+
+/* Offscreen image surface: a lockable GL texture with CPU staging. Used for
+ * screenshots and palette readbacks. */
+static HRESULT __stdcall dev_CreateImageSurface(IDirect3DDevice8 *s, UINT w, UINT h,
+        D3DFORMAT fmt, IDirect3DSurface8 **pp)
+{
+    GLSurface *t;
+    (void)s;
+    if (!pp) return D3DERR_INVALIDCALL;
+    t = gl_surface_new_owned(w, h, fmt, 0, 0);
+    if (!t) return D3DERR_INVALIDCALL;
+    *pp = &t->iface;
+    return D3D_OK;
+}
+
+/* The recompiled GPU layer uses 2D textures only; cube/volume textures are
+ * declined rather than left as a NULL vtable slot (which would fault). */
+static HRESULT __stdcall dev_CreateCubeTexture(IDirect3DDevice8 *s, UINT edge, UINT lvls,
+        DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DCubeTexture8 **pp)
+{ (void)s;(void)edge;(void)lvls;(void)usage;(void)fmt;(void)pool; if (pp) *pp = NULL; return D3DERR_INVALIDCALL; }
+static HRESULT __stdcall dev_CreateVolumeTexture(IDirect3DDevice8 *s, UINT w, UINT h, UINT d,
+        UINT lvls, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, IDirect3DVolumeTexture8 **pp)
+{ (void)s;(void)w;(void)h;(void)d;(void)lvls;(void)usage;(void)fmt;(void)pool; if (pp) *pp = NULL; return D3DERR_INVALIDCALL; }
 
 static HRESULT __stdcall dev_SetRenderTarget(IDirect3DDevice8 *s, IDirect3DSurface8 *rt,
                                               IDirect3DSurface8 *zs)
-{ (void)s;(void)rt;(void)zs; return D3D_OK; }
+{
+    GLSurface *r = (GLSurface *)rt;
+    GLSurface *z = (GLSurface *)zs;
+    (void)s;
+
+    g.cur_rt = rt;
+    g.cur_zs = zs;
+
+    if (r && r->fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+        if (z && z->gl_tex) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                   GL_TEXTURE_2D, z->gl_tex, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                   GL_TEXTURE_2D, z->gl_tex, 0);
+        } else {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                   GL_TEXTURE_2D, 0, 0);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                   GL_TEXTURE_2D, 0, 0);
+        }
+        g.target_w = (int)r->width;
+        g.target_h = (int)r->height;
+    } else {
+        /* Default target: the offscreen scene FBO the game renders into. It
+         * keeps its own depth renderbuffer. */
+        glBindFramebuffer(GL_FRAMEBUFFER, g.scene_fbo);
+        g.target_w = g.backbuf_w;
+        g.target_h = g.backbuf_h;
+    }
+    return D3D_OK;
+}
 static HRESULT __stdcall dev_GetRenderTarget(IDirect3DDevice8 *s, IDirect3DSurface8 **pp)
-{ (void)s; if(pp) *pp=NULL; return D3D_OK; }
+{
+    (void)s;
+    if (!pp) return D3DERR_INVALIDCALL;
+    *pp = g.cur_rt ? (IDirect3DSurface8 *)g.cur_rt : gl_backbuffer();
+    return D3D_OK;
+}
 static HRESULT __stdcall dev_GetDepthStencilSurface(IDirect3DDevice8 *s, IDirect3DSurface8 **pp)
-{ (void)s; if(pp) *pp=NULL; return D3D_OK; }
+{
+    (void)s;
+    if (!pp) return D3DERR_INVALIDCALL;
+    *pp = (IDirect3DSurface8 *)g.cur_zs;
+    return D3D_OK;
+}
 
 static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *s, const D3DVIEWPORT8 *vp)
 {
+    int th = g.target_h ? g.target_h : g.backbuf_h;
     (void)s; if (!vp) return D3DERR_INVALIDCALL;
     g.viewport = *vp;
-    glViewport((GLint)vp->X, (GLint)(g.backbuf_h - vp->Y - vp->Height),
+    /* D3D8's viewport origin is top-left; GL's is bottom-left. Flip against
+     * the current render target's height so offscreen targets are right. */
+    glViewport((GLint)vp->X, (GLint)(th - vp->Y - vp->Height),
                (GLsizei)vp->Width, (GLsizei)vp->Height);
     glDepthRange(vp->MinZ, vp->MaxZ);
     return D3D_OK;
@@ -958,6 +1433,10 @@ static const IDirect3DDevice8Vtbl g_device_vtbl = {
     dev_SetPalette,
     dev_BeginPush, dev_EndPush,
     dev_Swap,
+    /* xboxrecomp extension slots (must follow Swap, see d3d8_xbox.h). */
+    dev_CreateImageSurface,
+    dev_CreateCubeTexture,
+    dev_CreateVolumeTexture,
 };
 
 /* ======================================================================== */
@@ -1006,12 +1485,60 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
         return D3DERR_INVALIDCALL;
     }
     SDL_GL_MakeCurrent(g.window, g.glctx);
-    SDL_GL_SetSwapInterval(1);
+
+    /* Host window settings from settings.ini (see orta/src/main.c). The window
+     * is sized to the chosen height at the picture's aspect; the game still
+     * renders at its own back-buffer resolution, and dev_Present scales that
+     * to the window. */
+    {
+        const char *wh = getenv("RECOMP_WINDOW_HEIGHT");
+        const char *ws = getenv("RECOMP_WIDESCREEN");
+        const char *fs = getenv("RECOMP_FULLSCREEN");
+        const char *vs = getenv("RECOMP_VSYNC");
+        int height = wh ? atoi(wh) : 720;
+        int win_w, win_h;
+        if (height < 240) height = 240;
+        g.widescreen = !(ws && *ws == '0');
+        win_h = height;
+        win_w = height * g.backbuf_w / (g.backbuf_h ? g.backbuf_h : 1);
+        if (win_w < 240) win_w = 240;
+        SDL_SetWindowSize(g.window, win_w, win_h);
+        SDL_GL_SetSwapInterval((vs && *vs == '0') ? 0 : 1);
+        if (fs && *fs == '1')
+            SDL_SetWindowFullscreen(g.window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
 
     fprintf(stderr, "[d3d8_gl] GL %s / GLSL %s\n",
             glGetString(GL_VERSION), glGetString(GL_SHADING_LANGUAGE_VERSION));
 
     init_gl_pipeline();
+
+    /* The offscreen scene target the game renders into, at its own
+     * resolution. dev_Present scales it to the window; the back-buffer
+     * surface and screenshots read from here. */
+    glGenTextures(1, &g.scene_tex);
+    glBindTexture(GL_TEXTURE_2D, g.scene_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g.backbuf_w, g.backbuf_h, 0,
+                 GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenRenderbuffers(1, &g.scene_depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, g.scene_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, g.backbuf_w, g.backbuf_h);
+    glGenFramebuffers(1, &g.scene_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g.scene_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.scene_tex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g.scene_depth);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g.scene_depth);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        fprintf(stderr, "[d3d8_gl] scene framebuffer incomplete\n");
+    glBindFramebuffer(GL_FRAMEBUFFER, g.scene_fbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g.target_w = g.backbuf_w;
+    g.target_h = g.backbuf_h;
 
     /* Reasonable default states */
     mat4_identity(&g.m_world);

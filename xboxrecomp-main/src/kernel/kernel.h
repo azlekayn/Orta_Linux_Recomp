@@ -559,6 +559,11 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/* Create the parent directory of a translated host path when it is inside the
+ * writable save tree (a title copying assets into its cache). No-op on Windows,
+ * which has its own create path. */
+void xbox_path_make_parent(const char* host_path);
+
 /* Optional: a project sets this to see the guest paths the kernel translates
  * (for example to print who opened a file). NULL by default; called before the
  * path is translated, on the calling guest thread. Only paths a drive or
@@ -1080,28 +1085,6 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
  * that cost time while playing (per-draw tallies, periodic reports) skip
  * their work then. RECOMP_QUIET=0 or 1 overrides. */
 int recomp_diag_quiet(void);
-
-/* A guest thread that polls or yields in a tight loop (zero-timeout waits,
- * zero-length delays, NtYieldExecution) used to keep a whole host core busy:
- * SwitchToThread returns at once when nothing else is ready. Call this
- * instead: it yields for the first ~200 back-to-back calls, then sleeps 1 ms
- * per call while the thread keeps doing nothing but polling.
- * recomp_idle_reset() starts over (the poll found something). */
-void recomp_idle_backoff(void);
-void recomp_idle_reset(void);
-
-/* Guest polling loops (RECOMP_SPIN_HINT in recomp_types.h) block in
- * recomp_spin_slow() once they have spun for a while; host threads that move
- * what such loops wait on (the GPU executor publishing DMA_GET, the timer
- * thread) call recomp_spin_wake() to release them at once. */
-void recomp_spin_wake(void);
-
-/* The GPU executor's loop. recomp_exec_idle() ends a pass that found nothing
- * to execute: it yields for the first half millisecond of idling, then
- * blocks (at most 1 ms) until recomp_exec_kick() -- called when a guest
- * kicks off GPU work or starts polling for the GPU. */
-void recomp_exec_idle(int idle);
-void recomp_exec_kick(void);
 
 #ifdef _DEBUG
 #define XBOX_TRACE(subsystem, fmt, ...) xbox_log(XBOX_LOG_TRACE, subsystem, fmt, ##__VA_ARGS__)

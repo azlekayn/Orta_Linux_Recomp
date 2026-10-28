@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>   /* isatty for recomp_diag_quiet */
+#endif
 
 extern ptrdiff_t g_xbox_mem_offset;
 
@@ -55,6 +58,7 @@ static const char* xbox_log_level_str(int level)
 
 int recomp_diag_quiet(void)
 {
+#if defined(_WIN32)
     static int quiet = -1;
     if (quiet < 0) {
         const char *e = getenv("RECOMP_QUIET");
@@ -67,6 +71,19 @@ int recomp_diag_quiet(void)
         }
     }
     return quiet;
+#else
+    /* POSIX: stderr is "not a console" when it is not a tty, which is the
+     * same question (a redirected log means a script is driving the run). */
+    static int quiet = -1;
+    if (quiet < 0) {
+        const char *e = getenv("RECOMP_QUIET");
+        if (e && *e)
+            quiet = *e != '0';
+        else
+            quiet = !isatty(STDERR_FILENO);
+    }
+    return quiet;
+#endif
 }
 
 void xbox_log(int level, const char* subsystem, const char* fmt, ...)

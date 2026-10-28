@@ -169,7 +169,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
     if (Interval->QuadPart == 0) {
         /* Zero interval = yield the thread's time slice */
-        recomp_idle_backoff();
+        SwitchToThread();
         return STATUS_SUCCESS;
     }
 
@@ -301,143 +301,8 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode)
 
 NTSTATUS __stdcall xbox_NtYieldExecution(void)
 {
-    recomp_idle_backoff();
+    SwitchToThread();
     return STATUS_SUCCESS;
-}
-
-/* See kernel.h. "Back-to-back" means within 200 us of the last call (or of
- * waking from the last sleep), so a thread that does real work between polls
- * never sleeps. The 1 ms sleep is one scheduler tick at the 1 ms timer
- * resolution the runtime asks for. RECOMP_IDLE_SLEEP=0 turns it off. */
-static RECOMP_TLS LONGLONG t_idle_last;
-static RECOMP_TLS unsigned t_idle_run;
-
-/* ── Polling loops (RECOMP_SPIN_HINT) ─────────────────────────────────
- * Every 256 rounds of a marked loop: for the first half millisecond of a
- * spin, give the time slice away; after that, block on an event a host
- * thread sets when it moves something a guest may be waiting on, for at most
- * 1 ms. A loop that is really a short countdown never gets that far, and one
- * waiting on the GPU wakes as soon as the executor publishes progress.
- * RECOMP_SPIN_WAIT=0 keeps only the yield. */
-RECOMP_TLS uint32_t g_spin_count;
-static RECOMP_TLS LONGLONG t_spin_last, t_spin_since;
-static HANDLE s_spin_event;
-static volatile LONG s_spin_waiters;
-
-void recomp_spin_wake(void)
-{
-    if (s_spin_waiters > 0 && s_spin_event)
-        SetEvent(s_spin_event);
-}
-
-static HANDLE s_exec_event;
-static volatile LONG s_exec_waiting, s_exec_kicked;
-
-void recomp_exec_kick(void)
-{
-    s_exec_kicked = 1;
-    if (s_exec_waiting && s_exec_event)
-        SetEvent(s_exec_event);
-}
-
-void recomp_exec_idle(int idle)
-{
-    static LONGLONG freq;
-    static int on = -1;
-    static LONGLONG idle_since;
-    LARGE_INTEGER now;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_EXEC_IDLE_WAIT");
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        freq = f.QuadPart ? f.QuadPart : 1;
-        s_exec_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-        on = !(e && *e == '0') && s_exec_event;
-    }
-    QueryPerformanceCounter(&now);
-    /* A kick usually comes just before the work does (KickOff raises the
-     * flush, then writes PUT): stay quick for another half millisecond. */
-    if (s_exec_kicked) {
-        s_exec_kicked = 0;
-        idle_since = idle ? now.QuadPart : 0;
-        Sleep(0);
-        return;
-    }
-    if (!idle || !idle_since) {
-        idle_since = idle ? now.QuadPart : 0;
-        Sleep(0);
-        return;
-    }
-    if (!on || now.QuadPart - idle_since < freq / 2000) {
-        Sleep(0);
-        return;
-    }
-    InterlockedExchange(&s_exec_waiting, 1);
-    WaitForSingleObject(s_exec_event, 1);
-    InterlockedExchange(&s_exec_waiting, 0);
-}
-
-void recomp_spin_slow(void)
-{
-    static LONGLONG freq;
-    static int wait_on = -1;
-    LARGE_INTEGER now;
-    if (wait_on < 0) {
-        const char *e = getenv("RECOMP_SPIN_WAIT");
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        freq = f.QuadPart ? f.QuadPart : 1;
-        if (!s_spin_event) {
-            HANDLE h = CreateEventA(NULL, FALSE, FALSE, NULL);
-            if (InterlockedCompareExchangePointer((PVOID volatile *)&s_spin_event, h, NULL) != NULL)
-                CloseHandle(h);
-        }
-        wait_on = !(e && *e == '0');
-    }
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart - t_spin_last > freq / 500)      /* quiet for 2 ms: a new spin */
-        t_spin_since = now.QuadPart;
-    recomp_exec_kick();             /* a guest waiting on the GPU: let it run */
-    if (!wait_on || now.QuadPart - t_spin_since < freq / 2000) {
-        SwitchToThread();
-    } else {
-        InterlockedIncrement(&s_spin_waiters);
-        WaitForSingleObject(s_spin_event, 1);
-        InterlockedDecrement(&s_spin_waiters);
-    }
-    QueryPerformanceCounter(&now);
-    t_spin_last = now.QuadPart;
-}
-
-void recomp_idle_reset(void)
-{
-    t_idle_run = 0;
-}
-
-void recomp_idle_backoff(void)
-{
-    static LONGLONG freq, gap;
-    static int on = -1;
-    LARGE_INTEGER now;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_IDLE_SLEEP");
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        freq = f.QuadPart ? f.QuadPart : 1;
-        gap = freq / 5000;
-        on = !(e && *e == '0');
-    }
-    QueryPerformanceCounter(&now);
-    if (now.QuadPart - t_idle_last > gap)
-        t_idle_run = 0;
-    if (!on || ++t_idle_run < 200) {
-        SwitchToThread();
-        QueryPerformanceCounter(&now);
-    } else {
-        Sleep(1);
-        QueryPerformanceCounter(&now);
-    }
-    t_idle_last = now.QuadPart;
 }
 
 /* ============================================================================

@@ -92,6 +92,16 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+LONG InterlockedAnd(volatile LONG *Dest, LONG Value);
+LONG InterlockedOr(volatile LONG *Dest, LONG Value);
+LONG InterlockedAdd(volatile LONG *Dest, LONG Value);
+
+/* Spin-wait hint (x86 PAUSE; a no-op elsewhere). */
+#if defined(__i386__) || defined(__x86_64__)
+#define YieldProcessor() __asm__ __volatile__("pause")
+#else
+#define YieldProcessor() ((void)0)
+#endif
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -169,6 +179,8 @@ BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
+DWORD  GetThreadId(HANDLE thread);
+BOOL   SetThreadStackGuarantee(PULONG stackSizeInBytes);
 
 /* ---- Sleep ------------------------------------------------------------ */
 VOID  Sleep(DWORD ms);
@@ -271,6 +283,12 @@ BOOL  SetWindowTextA(HWND hwnd, LPCSTR text);
 int   GetWindowTextA(HWND hwnd, LPSTR text, int count);
 typedef BOOL (CALLBACK *WNDENUMPROC)(HWND hwnd, LPARAM lParam);
 BOOL  EnumWindows(WNDENUMPROC enumProc, LPARAM lParam);
+
+/* Dynamic-loading shims. There is no in-process Win32 module table on POSIX,
+ * so these resolve nothing; the (Windows-only) callers fall back when they
+ * return NULL. */
+HMODULE GetModuleHandleA(LPCSTR name);
+void   *GetProcAddress(HMODULE mod, LPCSTR name);
 
 /* MessageBox + flags (stderr stub on POSIX). */
 int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
@@ -432,21 +450,15 @@ VOID RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
                PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue);
 VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args);
 
-/* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
- * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. 
- * 
- * Note: GCC needs correct struct. This is from nxdk
- * */
-#ifdef __linux__
+/* Win32 VEH: PEXCEPTION_POINTERS carries a real EXCEPTION_RECORD and the
+ * XBOX_CONTEXT defined in xbox_winnt.h. The POSIX dispatcher in
+ * win32_compat.c fills both from a signal's ucontext_t, so a handler written
+ * against the Win32 shape works unchanged on Linux. */
 typedef struct _EXCEPTION_POINTERS
 {
     PEXCEPTION_RECORD ExceptionRecord;
     PCONTEXT ContextRecord;
 } EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
-#else
-typedef void *PEXCEPTION_POINTERS;
-#endif
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
@@ -538,9 +550,10 @@ WCHAR *xbox_wcscpy(WCHAR *dst, const WCHAR *src);
 BOOL SystemTimeToFileTime(const SYSTEMTIME *st, LPFILETIME ft);
 BOOL FileTimeToSystemTime(const FILETIME *ft, LPSYSTEMTIME st);
 
-/* ---- Multimedia (winmm) shim: waveOut stubs that always report failure.
- * The APU has a waveOut fallback path; on Linux it just stays inactive
- * and the (real) SDL2 audio path will replace it later. */
+/* ---- Multimedia (winmm) shim: the waveOut surface the APU's monitor uses.
+ * On POSIX it is implemented over SDL2 (src/apu/apu_sdl_audio.c) so the same
+ * double-buffered submit path produces sound. The types below are the Win32
+ * ones so the APU code is unchanged. */
 typedef DWORD  MMRESULT;
 typedef void  *HWAVEOUT;
 #define MMSYSERR_NOERROR     0
@@ -568,17 +581,13 @@ typedef struct tWAVEHDR {
     DWORD_PTR reserved;
 } WAVEHDR;
 
-static inline MMRESULT waveOutOpen(HWAVEOUT *h, UINT id, const WAVEFORMATEX *f,
-                                   DWORD_PTR cb, DWORD_PTR inst, DWORD flags)
-{ (void)h;(void)id;(void)f;(void)cb;(void)inst;(void)flags; return MMSYSERR_INVALPARAM; }
-static inline MMRESULT waveOutPrepareHeader(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
-{ (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutUnprepareHeader(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
-{ (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
-{ (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
-static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+MMRESULT waveOutOpen(HWAVEOUT *h, UINT id, const WAVEFORMATEX *f,
+                     DWORD_PTR cb, DWORD_PTR inst, DWORD flags);
+MMRESULT waveOutPrepareHeader(HWAVEOUT h, WAVEHDR *hdr, UINT sz);
+MMRESULT waveOutUnprepareHeader(HWAVEOUT h, WAVEHDR *hdr, UINT sz);
+MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz);
+MMRESULT waveOutReset(HWAVEOUT h);
+MMRESULT waveOutClose(HWAVEOUT h);
 
 #ifdef __cplusplus
 }
