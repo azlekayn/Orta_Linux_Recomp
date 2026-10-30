@@ -283,10 +283,11 @@ What was ruled out:
   `NtSuspendThread` 6.5M, `RtlEnter/LeaveCriticalSection` ~0.7M each. The
   0-timeout wait poll is already annotated in `kernel_bridge.c:1948` as Orta's
   **sound threads** (`SwitchToThread()` added for it), so the 59M is expected
-  noise, not the blocker; but the `NtSuspendThread` count (from
-  `sub_0022D43C`, `recomp_0047.c`) and `RtlLowerChar` (from `sub_0022EDFA`,
-  a `strlwr`) are worth a look — they point at the thread scheduler and a string
-  loop inside the resource/loader path.
+  noise, not the blocker. `NtSuspendThread` (6.5M) comes from `sub_0022D43C`
+  called by the D3D worker family (`sub_00233Cxx`), and the bridge
+  (`kernel_bridge.c:5150`) already special-cases **Orta's CRI movie server**
+  parking itself. **Tried `RECOMP_NOSUSPEND=1`** (makes every suspend a no-op):
+  still stalls. `RtlLowerChar` (24M) is `sub_0022EDFA`, a `strlwr`.
 
 - What still is **not** explained: the decoder thread in `sub_002521F0` runs
   (pointer advances) yet no frame ever reaches the GPU (tris flat for 15 min).

@@ -5154,6 +5154,16 @@ static void bridge_NtSuspendThread(void)
     DWORD tid = h ? GetThreadId(h) : 0;
     int tries;
 
+    {   /* Diagnostic: RECOMP_NOSUSPEND=1 makes every suspend a no-op (return
+         * success). If Orta's CRI movie server then decodes frames, its
+         * park/resume loop is what is stuck, not the decoder itself. */
+        const char *ns = getenv("RECOMP_NOSUSPEND");
+        if (ns && *ns == '1') {
+            if (count_va) BRIDGE_MEM32(count_va) = 0;
+            g_eax = 0;
+            return;
+        }
+    }
     /* Never leave a thread suspended while it holds a guest lock or a raised
      * IRQL. On the console a thread at DISPATCH_LEVEL cannot be suspended at
      * all, and a lock holder is released before anyone else needs it. Here
