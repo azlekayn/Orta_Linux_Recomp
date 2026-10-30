@@ -1301,14 +1301,28 @@ DWORD GetTickCount(void) { return (DWORD)GetTickCount64(); }
 BOOL QueryPerformanceCounter(PLARGE_INTEGER count)
 {
     struct timespec ts;
+    static int xbox = -1;
+    if (xbox < 0)
+        xbox = getenv("RECOMP_QPC_XBOX") != NULL;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    /* RECOMP_QPC_XBOX reports the counter at the real Xbox rate (3,375,000 Hz).
+     * Some titles hardcode that rate instead of calling
+     * KeQueryPerformanceFrequency, so on a host whose QPC runs at 1e9 the
+     * counter they read is ~300x what they expect and their frame pacing (the
+     * FMV included) goes wrong. Off unless asked for. */
+    if (xbox)
+        count->QuadPart = ((LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec) * 27LL / 8000LL;
+    else
+        count->QuadPart = (LONGLONG)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     return TRUE;
 }
 
 BOOL QueryPerformanceFrequency(PLARGE_INTEGER freq)
 {
-    freq->QuadPart = 1000000000LL;   /* QPC is in nanoseconds */
+    static int xbox = -1;
+    if (xbox < 0)
+        xbox = getenv("RECOMP_QPC_XBOX") != NULL;
+    freq->QuadPart = xbox ? 3375000LL : 1000000000LL;   /* nanoseconds by default */
     return TRUE;
 }
 

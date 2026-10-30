@@ -273,8 +273,25 @@ What was ruled out:
   `QueryPerformanceCounter`, which on POSIX is nanoseconds (`freq = 1e9`); on
   Windows it is ~1e7, and on real Xbox hardware it is 3,375,000 Hz. If the title
   hardcodes the Xbox rate instead of calling `KeQueryPerformanceFrequency`, its
-  frame pacing math diverges. `win32_compat.c:1301` is where to experiment
-  (e.g. report the Xbox rate and scale the counter).
+  frame pacing math diverges. **Tried and it did not help:**
+  `RECOMP_QPC_XBOX=1` (added in `win32_compat.c` — reports 3,375,000 Hz and
+  scales the counter accordingly) still stalls at the movie unchanged.
+
+- **The stall is a busy-wait.** Raising `RECOMP_KERNEL_LOG_BUDGET` shows the hot
+  kernel calls during the movie: `NtWaitForSingleObjectEx` (ordinal 234) **59.5M
+  calls, all returning `STATUS_TIMEOUT` (0x102)**, `RtlLowerChar` 24M,
+  `NtSuspendThread` 6.5M, `RtlEnter/LeaveCriticalSection` ~0.7M each. The
+  0-timeout wait poll is already annotated in `kernel_bridge.c:1948` as Orta's
+  **sound threads** (`SwitchToThread()` added for it), so the 59M is expected
+  noise, not the blocker; but the `NtSuspendThread` count (from
+  `sub_0022D43C`, `recomp_0047.c`) and `RtlLowerChar` (from `sub_0022EDFA`,
+  a `strlwr`) are worth a look — they point at the thread scheduler and a string
+  loop inside the resource/loader path.
+
+- What still is **not** explained: the decoder thread in `sub_002521F0` runs
+  (pointer advances) yet no frame ever reaches the GPU (tris flat for 15 min).
+  Either the decode genuinely never completes for this stream, or it completes
+  into memory nothing displays.
 
 Practical note: mashing buttons during the black screen **does** get past the FMV
 (the engine then renders, `tris` 585k → 110M+), but it settles on a static
