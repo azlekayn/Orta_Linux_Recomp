@@ -177,6 +177,51 @@ So the hang is a game-logic wait: the main thread blocks on a kernel object that
 a loader/decoder thread never signals. It happens after difficulty select, at
 the transition into the first stage / opening movie.
 
+### Update (2026-10-30, later): it is the **FMV (MPEG-2)**, and it *is* skippable
+
+Solved what the "black" frame actually is:
+
+- The **waits are not a hang.** With `RECOMP_VBLSTAT=1`, vblanks keep firing and
+  being claimed (600/10 s) and the three `sub_002ADCB0` waiters **cycle**
+  (`title events: 600 sets, 1000+ waits` per 10 s). They wake every vblank and
+  re-wait — normal D3D pacing. The frame loop keeps running; the screen is black
+  because nothing is drawn, not because the game is stuck.
+- The only genuinely stuck thread is the loader, pinned in a **tight loop**
+  inside `sub_002521F0` (same host PC `0x14d3b2a` across samples). Call chain:
+  `sub_002521F0` ← `sub_00245020` ← `sub_00245BD0` ← `sub_002475B0` ←
+  `sub_00247600` ← `sub_0024E210` ← `sub_0024B110` ← `sub_0024B210` ←
+  `sub_00248A30` ← `sub_00248B50` ← `sub_00236BC0` ← `sub_00233D60`.
+  `sub_002521F0` is a **4-state `00 00 01` start-code scanner** (game_vtable
+  category) — i.e. an MPEG-2 elementary-stream parser.
+- The `[READ]` log settles it: the last reads are 1 MB chunks of
+  **`00 00 01 BA`** (MPEG-2 pack header) into guest buffers `0x019CE600`,
+  `0x01ACE600`, `0x01BCE600`, `0x01CCE600`, `0x01DCE600` (~5 MB), then stop. The
+  scanner loop sits right on those buffers (`rdx≈0x019B111A`, end `≈0x019C8800`).
+  So after difficulty select Orta plays an **FMV** and its own MPEG decoder loops.
+- **The movie is skippable by the player.** Adding A/Start presses during the
+  black phase (`RECOMP_AUTOPAD=...,a@3120,a@3250,start@3400,...`) carries the
+  game past it: `tris` jumps from ~585k to **110 M+**, `surfaces` 2→4,
+  `textures` 16→108 — the game starts rendering. So the *engine* is fine; only
+  the FMV decode/render path is.
+- After the skip the game settles on a **solid green (or cyan) rectangle** and
+  freezes (`nonblack` constant for 150 s). That is the **video surface** drawn
+  with an unsupported/unconverted format, not decoded video. `nv2a_gpu_gl.c`
+  has a PVIDEO overlay path (`nv2a_exec_pvideo`, ~L217/L955) but it is not
+  producing the FMV image here.
+
+Next steps (video path):
+1. Find which movie file this is (~5 MB, MPEG-2). The game's disc has `.sfd`
+   Sofdec files; match the 5 MB read to one of them.
+2. Decide whether the **decoder loop** is a recompiler bug in the MPEG code (SSE2
+   IDCT / motion compensation) or genuinely waiting for more stream. Note
+   `[UNIMPL] stmxcsr` keeps being hit at guest `0x00269711` — check whether that
+   no-op changes decoder results.
+3. Fix the **video surface format** in `nv2a_gpu_gl.c` (the solid green/cyan
+   fullscreen quad). Check `nv2a_exec_pvideo` / the overlay RGBA and any YUV or
+   luminance-surface upload path.
+4. Meanwhile, gameplay itself is reachable by skipping the movie, so the rest of
+   the engine (geometry, textures, HUD) can be exercised now.
+
 Things to try next:
 1. `RECOMP_VBLSTAT=1`: do vblanks keep being raised/claimed through the hang, or
    does the vblank thread stall too? (Records vblanks, PMC bit, title event

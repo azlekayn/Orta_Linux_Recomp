@@ -988,9 +988,19 @@ void nv2a_gpu_flip(uint32_t present_base)
     {
         const char *dump = getenv("RECOMP_GL_DUMP");
         const char *df = getenv("RECOMP_GL_DUMP_FLIP");
-        int want = df ? atoi(df) : 2500;
-        if (dump && (int)G.c_flip == want && s)
-            gl_dump_surf(s, dump);
+        const char *every = getenv("RECOMP_GL_DUMP_EVERY");
+        if (dump && every && s) {
+            int p = atoi(every);
+            if (p > 0 && (int)G.c_flip % p == 0) {
+                char path[512];
+                snprintf(path, sizeof path, "%s%u.bmp", dump, G.c_flip);
+                gl_dump_surf(s, path);
+            }
+        } else if (dump) {
+            int want = df ? atoi(df) : 2500;
+            if ((int)G.c_flip == want && s)
+                gl_dump_surf(s, dump);
+        }
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     {
