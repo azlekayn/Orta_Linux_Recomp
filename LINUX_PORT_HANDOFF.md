@@ -211,6 +211,25 @@ Session note (2026-10-30):
 - No desktop window: `run_game.sh` sets `RECOMP_GL_HIDE=1`. An `Xvfb` display
   would be cleaner still if available.
 
+Update (2026-10-30, later):
+- Runs now use **Xvfb** (`Xvfb :99 -screen 0 1280x960x24`, llvmpipe GL 4.6 core);
+  set `DISPLAY=:99`. No desktop window. (The on-screen window under llvmpipe
+  comes back black; the **surface dump is the reliable signal**.)
+- The main thread's hang is a **`KeWaitForSingleObject`** on
+  **`*(0x2BD708) + 0x2554`** (waitreason 6, KernelMode, INFINITE) — see
+  `sub_002ADCB0` in `orta/src/recomp/gen/recomp_0066.c`. `0x2BD708` is the D3D
+  device pointer (`RECOMP_SEMA_DEVPTR`); the object is a D3D device event.
+- The runtime signals the D3D fence-interrupt event at **`dev + 0x2564`** by
+  default (`nv2a_pb_exec.c` ~L4463, `method==0x0100&&param`, overridable with
+  `RECOMP_GPU_INTR_EVENT`). Orta waits at **`+0x2554`** here — a 0x10 mismatch.
+  **But** overriding `RECOMP_GPU_INTR_EVENT=0x2554` stalled the *boot* (the NOP
+  interrupt then set `dev+0x2554` = `0x2C0404` instead of the default
+  `0x2C0414`), so the title uses more than one device event and a blind offset
+  swap is wrong. Determine which event each wait is on, and signal the matching
+  one (possibly signal both, or find the right device base).
+- The `KeSetEvent` used by the vblank routine is thunk `0x30C9E4`
+  (ordinal 145); the wait is thunk `0x30C9E8` (ordinal 159).
+
 ## Other open issues
 
 - **Cyan square artifacts** on the title (a texture/combiner-stage fidelity
