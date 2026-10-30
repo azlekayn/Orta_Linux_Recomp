@@ -5,6 +5,8 @@ DIR="/mnt/SSD Storage/Games/Ports/xbox/Orta_PC_Recomp-0.5.1_Beta/orta"
 cd "$DIR" || exit 1
 
 export DISPLAY="${DISPLAY:-:0}"
+# Keep the window off the desktop for unattended runs (SDL_WINDOW_HIDDEN).
+export RECOMP_GL_HIDE="${RECOMP_GL_HIDE:-1}"
 # Engine switches normally carried in engine.ini [Advanced]:
 export RECOMP_PB_EXEC=1
 export RECOMP_VBLANK=1

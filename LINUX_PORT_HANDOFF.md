@@ -84,8 +84,11 @@ RECOMP_AUTOPAD='start@1120,a@1400,a@1700,start@2100,start@2600,a@3000' \
 
 - `RECOMP_GL_DUMP=/path.bmp` + `RECOMP_GL_DUMP_FLIP=<flip>` — dump the presented
   surface to a BMP at that flip (convert with `ffmpeg -i x.bmp x.png`).
+- `RECOMP_GL_HIDE=1` — create the SDL window hidden (keeps automated runs off the
+  desktop; GL still renders). `run_game.sh` sets it by default.
 - `RECOMP_GL_NODEPTH`, `RECOMP_GL_NOCULL`, `RECOMP_GL_NOSCISSOR` — isolate state.
 - `RECOMP_NO_COMBINERS` — force the simple `texel*diffuse` path.
+- `RECOMP_VBLSTAT=1` — every 10 s, vblanks raised/claimed and title-event counts.
 - `RECOMP_PORT_IN=<n>` — value returned by the `in al, dx` emulation.
 - `RECOMP_UNIMPL_TRAP=1` — abort at the first untranslated instruction.
 - `[GPU-GL]` stderr lines: flips/tris/clears/surfaces/textures/present, and the
@@ -145,34 +148,68 @@ Orta (`orta/`):
 
 Symptom: after the scripted menu selection, frames take hundreds of ms to
 seconds (`[HITCH] frame N took 3416.8 ms ... idle`), `tris` flatlines, no
-geometry, no `[PVIDEO]`, screen black.
+geometry, no `[PVIDEO]`, screen black. It is a **hang, not slowness**:
+`RECOMP_STALL_EXIT_SECS` fired (exit code 3) after 180 s with no drawing, and
+NV2A `PUT == GET` (the executor has nothing to do).
 
-Trace: the game loops in a driver function; the last stderr lines are repeated
-`[UNIMPL] untranslated instruction REACHED: 'in al, dx' at 0x002B5A7D`
-(recompiled at `orta/src/recomp/gen/recomp_0067.c`). Reading that code:
+Evidence from a long run (240 s, scripted Start+A to the menu):
+- GPU: `flips` climb slowly then stop mattering; `tris` stuck at ~585k;
+  `PUT == GET` → the title submits no new work.
+- gdb thread stacks during the stall:
+  - main thread: `KeWaitForSingleObject` ← `sub_002ADCB0` ← `sub_00068C10` ←
+    `sub_000AD510` ← … (the game's main init path waits on a kernel object).
+  - threads 2 and 4: same `sub_002ADCB0` wait, from `sub_00234120` /
+    `sub_00233CF0`.
+  - thread 3: **busy** (no syscall) in `sub_002521F0` ← `sub_00245020` ←
+    `sub_00245BD0` ← … (a decoder/loader — likely the resource or FMV path).
+  - loader/ack threads idle in `nv2a_ack_thread` / `nv2a_flush_ack_thread`.
+- Directory scans look correct (`[QDIR]` finds `rendersettingbinNN.rsb` then
+  reports no-more). The game keeps re-opening via guest `0x0022E41E` (the
+  resource/cache helper).
+- `[UNIMPL] in al, dx` at `0x002B5A7D` repeats (a driver routine reading I/O
+  port `0x80C0` then a vblank wait at `0x002B5AB0`: writes `edi+0x600100`
+  = PCRTC_INTR_0 and spins while `edi+0x100` (PMC_INTR_0) bit 24 is set). It is
+  emulated now (`recomp_manual.c:recomp_unimpl`, `RECOMP_PORT_IN`), but that did
+  not unstick it. Note the vblank→ISR path does work early on
+  (`[NV2A] vblank -> ISR claimed it`).
 
-- `0x002B5A79`: `edx=0x80C0; in al, dx` — reads I/O port **0x80C0** (emulated in
-  `orta/src/recomp_manual.c:recomp_unimpl`, value via `RECOMP_PORT_IN`, default 0).
-- `0x002B5AB0`: `MEM32(edi+0x600100) = ecx;` then spins while
-  `MEM32(edi+0x100) & 0x1000000` is set. `0x600100` is PCRTC_INTR_0, `0x100` is
-  PMC_INTR_0, bit 24 is the PCRTC interrupt. This is a **vblank wait**.
-- So the stall is in the vblank/interrupt modelling (`RECOMP_VBLANK`,
-  `RECOMP_PCRTC_TRAP`) or in how the opening movie (Sofdec, game-decoded) is
-  presented. The port-I/O emulation alone did not unstick it.
+So the hang is a game-logic wait: the main thread blocks on a kernel object that
+a loader/decoder thread never signals. It happens after difficulty select, at
+the transition into the first stage / opening movie.
 
 Things to try next:
-1. Determine whether the loop is the `loc_002B5AB0` vblank spin (bit 24 stuck
-   set) or the caller's loop. `RECOMP_UNIMPL_TRAP=1` stops at the first `in`, not
-   the spin; add a counter/log at the spin or use gdb (`break` on the generated
-   function, or interrupt and `bt`) during the stall.
-2. Check the vblank path: `RECOMP_VBLANK=1`; does the runtime set PMC_INTR_0 bit
-   24 each vblank, and does the title's ISR (or our ack thread) clear it? The
-   `NV2A: PCRTC_INTR is write-1-to-clear` trap is on (`RECOMP_PCRTC_TRAP=1`).
-3. Watch which files the game opens right before the stall (the log's `[OPEN]`
-   lines) — is it opening an `.sfd` movie? If so, the movie is decoded by the
-   game's own `PSGSFD*`/`WMADEC` code; work out how it presents it (PVIDEO
-   overlay vs. a textured quad). The GL backend now composites the overlay
-   (`nv2a_exec_pvideo`) but nothing activates it here.
+1. `RECOMP_VBLSTAT=1`: do vblanks keep being raised/claimed through the hang, or
+   does the vblank thread stall too? (Records vblanks, PMC bit, title event
+   sets/waits every 10 s.)
+2. Identify `sub_002521F0` (the busy thread) and `sub_002ADCB0` (the wait) — dump
+   the guest stack at the stall (watchdog) and read the recompiled C: which
+   event does `sub_002ADCB0` wait on, and which thread/function signals it?
+3. Check the loader override `recomp_manual.c:sub_00014D50` — it only drains
+   `pending_list_0x3410A0`; if the hang is a load queued elsewhere, it never
+   runs.
+4. Watch files opened just before the hang and whether the title is trying to
+   start the opening movie (`.sfd`); no `.sfd` open was logged, so it is likely
+   still in resource/cache loading, not the movie.
+5. `RECOMP_UNIMPL_TRAP=1` / `RECOMP_WATCHDOG_SECS=<n>` to stop/dump right at the
+   hang rather than after 180 s.
+
+Session note (2026-10-30):
+- `RECOMP_VBLSTAT=1` samples show `vblanks 600 (claimed 600)` (60 Hz, ISR claims
+  them) but `PMC 01000000` (PMC_INTR_0 bit 24 set) and `handled 0` (the title's
+  vblank counter at `0x2C0430` is *not* advancing). So the vblank wait may be
+  stuck because the title ISR is not actually acking/advancing.
+- The PCRTC trap already gives `PCRTC_INTR_0` its write-1-to-clear meaning **and
+  clears PMC bit 24 on the title's ack**
+  (`xbox_memory_layout.c:pcrtc_write_veh`, ~line 1404). Clearing PMC bit 24
+  unconditionally after `kernel_raise_interrupt` in `kernel_vblank_tick`
+  **regressed the boot** (the game stalled at start-up), so do not do that — the
+  ack has to come from the title's write.
+- Added to the GL backend (this session): `RECOMP_GL_HIDE` (hidden SDL window for
+  unattended runs) and re-upload of surfaces the GPU did not draw this frame
+  (`surf_upload` when `touched_frame + 1 < frame`), so CPU-written frames (the
+  FMV decoder) can appear.
+- No desktop window: `run_game.sh` sets `RECOMP_GL_HIDE=1`. An `Xvfb` display
+  would be cleaner still if available.
 
 ## Other open issues
 

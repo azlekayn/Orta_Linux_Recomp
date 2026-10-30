@@ -251,6 +251,7 @@ typedef struct {
     uint32_t base, pitch, bpp, w, h;
     GLuint   tex, fbo, depth;
     int      uploaded, dirty, used, drawn;
+    uint32_t touched_frame;        /* last frame the GPU drew into this */
     int32_t  bx0, by0, bx1, by1;    /* union of GPU-drawn rects, -1 = none */
     uint64_t hash;
 } GSurf;
@@ -379,7 +380,9 @@ static int gpu_init(void)
     }
     G.win = SDL_CreateWindow("Xbox Game", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                              (int)(G.winh * 4.0f / 3.0f), (int)G.winh,
-                             SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+                             SDL_WINDOW_OPENGL |
+                             (getenv("RECOMP_GL_HIDE") ? SDL_WINDOW_HIDDEN
+                                                       : SDL_WINDOW_SHOWN));
     if (!G.win) { fprintf(stderr, "[GPU-GL] window: %s\n", SDL_GetError()); return 0; }
     G.ctx = SDL_GL_CreateContext(G.win);
     if (!G.ctx) { fprintf(stderr, "[GPU-GL] gl context: %s\n", SDL_GetError()); SDL_DestroyWindow(G.win); G.win=NULL; return 0; }
@@ -785,6 +788,7 @@ void nv2a_gpu_begin(const Nv2aGpuState *st)
     }
     if ((st->color_mask & 0x01010101u) && s->base != 0x80000000u) {
         s->dirty = 1;
+        s->touched_frame = G.frame;
         if (st->clip_w && st->clip_h)
             surf_touch(s, (int32_t)st->clip_x, (int32_t)st->clip_y,
                        (int32_t)(st->clip_x + st->clip_w), (int32_t)(st->clip_y + st->clip_h));
@@ -851,6 +855,7 @@ void nv2a_gpu_clear(const Nv2aGpuState *st, int color, uint32_t argb,
     }
     if (color && s->base != 0x80000000u) {
         s->dirty = 1;
+        s->touched_frame = G.frame;
         if (st->clip_w && st->clip_h)
             surf_touch(s, (int32_t)st->clip_x, (int32_t)st->clip_y,
                        (int32_t)(st->clip_x + st->clip_w), (int32_t)(st->clip_y + st->clip_h));
@@ -940,6 +945,12 @@ void nv2a_gpu_flip(uint32_t present_base)
                 G.c_flip, G.c_tri, G.c_clear, G.c_surf, G.c_tex, present_base,
                 surf_find(present_base) ? "" : " (no surface)");
     s = surf_find(present_base);
+
+    /* The title can write the frame with the CPU (the FMV decoder). If the GPU
+     * did not draw this surface this frame, guest memory is the source of
+     * truth -- upload it so the decoded frame is shown, not the stale texture. */
+    if (s && s->touched_frame + 1 < G.frame)
+        surf_upload(s);
 
     /* NV2A video overlay (the FMV plane): composite it into the frame before
      * write-back and present, as the D3D11 backend does in present_overlay. */
