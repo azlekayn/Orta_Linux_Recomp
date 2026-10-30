@@ -210,17 +210,33 @@ Solved what the "black" frame actually is:
   producing the FMV image here.
 
 Next steps (video path):
-1. Find which movie file this is (~5 MB, MPEG-2). The game's disc has `.sfd`
-   Sofdec files; match the 5 MB read to one of them.
-2. Decide whether the **decoder loop** is a recompiler bug in the MPEG code (SSE2
-   IDCT / motion compensation) or genuinely waiting for more stream. Note
+1. **The movie is `game_files/movie/op_plus.sfd`** — 4,956,160 bytes, and the
+   read total matches it exactly (4×1 MB + 761,856). It is an **MPEG-2 program
+   stream**, byte-for-byte the same container as the working
+   `opening_bs.sfd` (`00 00 01 BA` pack / `00 00 01 BB` system / `00 00 01 BE`
+   PES). So the container is not the problem — the game's own decoder spins
+   while parsing it.
+2. `RECOMP_SKIP_SFD=1` (a diagnostic in `bridge_create_file_impl`) makes `.sfd`
+   opens fail: the game then stalls *earlier* (flip ~2400, menu transition), so
+   it does not gracefully skip the movie — do not use it as a workaround.
+3. Pressing buttons during the black screen (autopad) *does* get past it (the
+   player can skip the FMV), proving the engine is otherwise fine; the green
+   fullscreen quad afterwards is a separate presentation issue.
+4. Next: decide whether the decoder loop is a recompiler bug in the MPEG code
+   (SSE2 IDCT / motion compensation) or genuinely waiting for more stream.
+   The caller chain is `sub_00245BD0` → `sub_00245020` → `sub_002521F0`;
+   `sub_00245BD0` calls the scanner with a **small stack buffer** (`esp+0x18`,
+   length `0xCE`), so the spin is likely an **outer parse loop that never
+   advances** rather than one huge scan — check the return value the caller uses
+   to move through the stream.
    `[UNIMPL] stmxcsr` keeps being hit at guest `0x00269711` — check whether that
-   no-op changes decoder results.
-3. Fix the **video surface format** in `nv2a_gpu_gl.c` (the solid green/cyan
-   fullscreen quad). Check `nv2a_exec_pvideo` / the overlay RGBA and any YUV or
-   luminance-surface upload path.
-4. Meanwhile, gameplay itself is reachable by skipping the movie, so the rest of
-   the engine (geometry, textures, HUD) can be exercised now.
+   no-op changes decoder results. A good probe: dump the decoder's output
+   surface while it runs, and compare the scanner's consumed position over time.
+5. Fix the **video presentation** (the solid green/cyan fullscreen quad) seen
+   once the movie is skipped. No `[PVIDEO]` and no `[TEXFAIL]` are logged, so it
+   is neither the overlay path nor an undecoded texture format — find what
+   method draws the movie frame (likely a blit/scaler the executor ignores, or a
+   CPU-written surface the GL backend does not re-upload at present).
 
 Things to try next:
 1. `RECOMP_VBLSTAT=1`: do vblanks keep being raised/claimed through the hang, or

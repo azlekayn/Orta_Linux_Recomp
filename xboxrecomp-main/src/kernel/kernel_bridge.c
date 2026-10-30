@@ -3580,6 +3580,24 @@ static NTSTATUS bridge_create_file_impl(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    {   /* Diagnostic: RECOMP_SKIP_SFD=1 makes every .sfd (Sofdec movie) open
+         * fail. Orta plays movie/op_plus.sfd after the difficulty menu and its
+         * own MPEG-2 decoder spins on it (see LINUX_PORT_HANDOFF.md); failing
+         * the open tests whether the title skips the movie and carries on. */
+        const char *sk = getenv("RECOMP_SKIP_SFD");
+        size_t nl = name.Length;
+        if (sk && *sk == '1' && nl >= 4) {
+            const char *t = name.Buffer + nl - 4;
+            if ((t[0] == '.' || t[0] == '.')
+                && (t[1] | 0x20) == 's' && (t[2] | 0x20) == 'f' && (t[3] | 0x20) == 'd') {
+                fprintf(stderr, "  [FILE] %.90s -> SKIPPED (.sfd, RECOMP_SKIP_SFD)\n",
+                        name.Buffer);
+                bridge_write_iostatus(iostatus_va, STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+        }
+    }
+
     if (bridge_is_cdrom_device(name.Buffer)) {
         fprintf(stderr, "  [FILE] %s -> synthetic DVD device handle\n",
                 name.Buffer);
