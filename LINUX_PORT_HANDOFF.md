@@ -238,6 +238,48 @@ Next steps (video path):
    method draws the movie frame (likely a blit/scaler the executor ignores, or a
    CPU-written surface the GL backend does not re-upload at present).
 
+### Update (2026-10-30, later still): the FMV decoder produces **no frames**
+
+Ran the movie, unskipped, for **15 minutes** (`/tmp/long.txt`): `flips` climb to
+26100, `tris` stays flat at ~627k, screen stays black. So it is not slowness.
+
+What was ruled out:
+
+- **Not an `-O3` miscompile.** Rebuilt `recomp_0052.c` (holds `sub_002521F0`) at
+  `-O1` and relinked — still stalls. (The object is back at `-O3`.)
+- **Not a stuck loop.** A breakpoint at the scan-loop top (`*0x14d3a70`) shows
+  the pointer `edx` advancing `0x1970086, 0x1970087, …`. An earlier "frozen
+  pointer" reading was a gdb artifact: registers do **not** refresh across
+  `shell sleep` in one attach — use two separate attaches.
+- **Not the NV2A video overlay.** `RECOMP_PVIDEO_DEBUG=1` (added to
+  `nv2a_pb_exec.c:nv2a_exec_pvideo`) prints the PVIDEO registers ~2×/s; during
+  the movie they are all zero (`700=0 704=0 928=FFFFFFFF 958=0 …`). The title
+  never programs the overlay, so `nv2a_exec_pvideo` never returns a frame. There
+  is also **no D3D8 overlay method** in the HLE vtable (`d3d8_device.c:1406`) —
+  `d3d8_check_overlay()` is unrelated (a struct-alignment check).
+- **Not the guest framebuffer.** Dumped guest phys `0xBA000` and `0x24000`
+  (640×480×4) during the movie: pure random garbage (unwritten memory), identical
+  across samples. The GPU presents via its own GL surface, so this is expected.
+- **GPU is idle during the movie**: `[PB] 0 pushbuffer calls followed`, only
+  2 clears/frame, no triangles. Audio does run (`[APU] peak 457`).
+- **Platform gap found:** the port's two host-side display paths are both
+  `#if defined(_WIN32)` — `video/video_pump.c` (Media Foundation, `.wmv` only,
+  behind `RECOMP_FMV_HOST`, off by default) and `video/fb_present.c`
+  (GDI framebuffer window, `RECOMP_FB_WINDOW`, off). So on Linux there is **no
+  host-side movie playback**; only the title's own decoder. If Windows plays the
+  `.sfd`, the difference must be in something the decoder's guest code depends on
+  that the HLE provides differently.
+- Candidate: **timing.** `xbox_KeQueryPerformanceCounter` maps straight to host
+  `QueryPerformanceCounter`, which on POSIX is nanoseconds (`freq = 1e9`); on
+  Windows it is ~1e7, and on real Xbox hardware it is 3,375,000 Hz. If the title
+  hardcodes the Xbox rate instead of calling `KeQueryPerformanceFrequency`, its
+  frame pacing math diverges. `win32_compat.c:1301` is where to experiment
+  (e.g. report the Xbox rate and scale the counter).
+
+Practical note: mashing buttons during the black screen **does** get past the FMV
+(the engine then renders, `tris` 585k → 110M+), but it settles on a static
+green/cyan quad — so even the skip path has a second bug after the movie.
+
 Things to try next:
 1. `RECOMP_VBLSTAT=1`: do vblanks keep being raised/claimed through the hang, or
    does the vblank thread stall too? (Records vblanks, PMC bit, title event

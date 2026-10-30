@@ -5400,6 +5400,20 @@ int nv2a_exec_pvideo(const uint32_t **rgba, uint32_t *w, uint32_t *h,
     }
     if (off)
         return 0;
+    {   /* Diagnostic: RECOMP_PVIDEO_DEBUG prints the overlay registers about
+         * twice a second, so a title whose FMV stays black shows whether it
+         * ever set up the overlay and with what format. */
+        static int dbg = -1;
+        static unsigned n;
+        if (dbg < 0)
+            dbg = getenv("RECOMP_PVIDEO_DEBUG") != NULL;
+        if (dbg && (n++ % 120) == 0)
+            fprintf(stderr, "[PVIDEO-DBG] 700=%08X 704=%08X 928=%08X 958=%08X"
+                            " 900=%08X 920=%08X 948=%08X 950=%08X\n",
+                    PVIDEO_REG(0x700), PVIDEO_REG(0x704), PVIDEO_REG(0x928),
+                    PVIDEO_REG(0x958), PVIDEO_REG(0x900), PVIDEO_REG(0x920),
+                    PVIDEO_REG(0x948), PVIDEO_REG(0x950));
+    }
     if (PVIDEO_REG(0x704) & 1u) {                          /* STOP */
         PVIDEO_REG(0x704) = 0;
         PVIDEO_REG(0x700) = 0;
