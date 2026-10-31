@@ -298,6 +298,35 @@ Practical note: mashing buttons during the black screen **does** get past the FM
 (the engine then renders, `tris` 585k → 110M+), but it settles on a static
 green/cyan quad — so even the skip path has a second bug after the movie.
 
+### Update (2026-10-30, final): the decoder stalls on *every* movie, and the
+### next state is a sleeping wait
+
+- **ffmpeg decodes the movies fine** (`movie/op_plus.sfd`: MPEG-1, 640×368,
+  ~30 fps, ~24 s; audio = CRI ADX). So the streams are valid.
+- **Substituting a short clip for `op_plus.sfd` gets the game past that movie**
+  — it then opens the *next* movie (`opening_bs.sfd` etc.) and stalls there. So
+  the guest decoder stalls on **all** real Sofdec streams, not just one.
+- **Shortening *every* `.sfd`** (a throwaway test, originals restored) still
+  ends on a **static green rectangle** at ~flip 3000: a centred 16:9 quad.
+  Green = the movie area painted with the decoder's **empty frame**
+  (YUV(Y=0,U=0,V=0) → RGB(0,135,0)); the video texture never gets real pixels.
+- At that green state **all guest threads are asleep** (the main thread in
+  `sub_0022D2A6`, a `WaitForSingleObject` with timeout, under
+  `sub_000121F0`/`sub_000A19F0`/…/`sub_000BD410`). So the game is *waiting on an
+  event that never signals*, not spinning. The movie area is drawn each frame
+  (a few hundred tris), the executor runs, but nothing advances it.
+
+New gated diagnostics added this session (all off by default):
+`RECOMP_TEXLOG` (distinct texture formats), `RECOMP_FILELOG` (every file open
+with its path — this is how the movie layering was mapped), `RECOMP_PVIDEO_DEBUG`
+(PVIDEO registers), `RECOMP_NOSUSPEND`, `RECOMP_QPC_XBOX`, `RECOMP_SKIP_SFD`.
+
+**Where this leaves it:** the engine, GPU backend and input all work; two
+guest-side things don't — the Softdec/CRI decoder produces no frames, and the
+state after it sleeps forever on an event. Fixing the decoder (or making the
+title's movie player see an immediately-finished stream) is the crux; a host-side
+`.sfd` player alone won't help because the title itself waits on its own decoder.
+
 Things to try next:
 1. `RECOMP_VBLSTAT=1`: do vblanks keep being raised/claimed through the hang, or
    does the vblank thread stall too? (Records vblanks, PMC bit, title event

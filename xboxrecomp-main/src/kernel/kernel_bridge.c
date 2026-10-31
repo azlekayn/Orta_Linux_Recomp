@@ -3580,6 +3580,11 @@ static NTSTATUS bridge_create_file_impl(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    if (getenv("RECOMP_FILELOG")) {
+        fprintf(stderr, "  [FILELOG] open '%.*s'\n", (int)name.Length, name.Buffer);
+        fflush(stderr);
+    }
+
     {   /* Diagnostic: RECOMP_SKIP_SFD=1 makes every .sfd (Sofdec movie) open
          * fail. Orta plays movie/op_plus.sfd after the difficulty menu and its
          * own MPEG-2 decoder spins on it (see LINUX_PORT_HANDOFF.md); failing

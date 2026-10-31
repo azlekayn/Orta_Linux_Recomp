@@ -2190,6 +2190,29 @@ int nv2a_exec_tex_decode(const Nv2aGpuTexDesc *d, uint32_t face, uint32_t *out)
 {
     Texture t;
     uint32_t x, y, fo, px, n = d->width * d->height;
+    {   /* RECOMP_TEXLOG: one line per distinct texture format+size, so the
+         * format a title uses for an FMV (a YUV surface drawn green) is
+         * identifiable. */
+        static int on = -1;
+        if (on < 0)
+            on = getenv("RECOMP_TEXLOG") != NULL;
+        if (on) {
+            static uint32_t seen[128][4];
+            static int ns;
+            int i, hit = 0;
+            for (i = 0; i < ns; i++)
+                if (seen[i][0] == d->color && seen[i][1] == d->width
+                        && seen[i][2] == d->height) { hit = 1; break; }
+            if (!hit && ns < 128) {
+                seen[ns][0] = d->color; seen[ns][1] = d->width;
+                seen[ns][2] = d->height; seen[ns][3] = d->pitch;
+                ns++;
+                fprintf(stderr, "[TEXLOG] fmt=%08X %ux%u pitch=%u off=%08X\n",
+                        d->color, d->width, d->height, d->pitch, d->offset);
+                fflush(stderr);
+            }
+        }
+    }
     tex_from_desc(&t, d);
     fo = d->cube ? face * tex_face_stride(&t) : 0;
     {
